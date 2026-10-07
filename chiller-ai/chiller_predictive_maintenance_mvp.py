@@ -147,6 +147,25 @@ def run_anomaly_detection(feat: pd.DataFrame, contamination: float = 0.01, seed:
     return out
 
 
+# ===== NEW: persistence filter + hard fail-safe limits ===================== #
+PERSIST_WINDOW = 5          # look-back window (timestamps)
+PERSIST_MIN_HITS = 3        # anomalies required inside the window to raise an alert
+HARD_LIMIT_APPROACH_C = 5.5
+HARD_LIMIT_VIBRATION = 6.5  # mm/s
+
+
+def apply_persistence_filter(df: pd.DataFrame, window: int = PERSIST_WINDOW,
+                             min_hits: int = PERSIST_MIN_HITS) -> pd.DataFrame:
+    """Noise reduction: an alert is only 'persistent' when >= min_hits of the last `window`
+    readings were flagged by the Isolation Forest. Isolated single anomalies stay False."""
+    out = df.copy()
+    out["raw_anomaly"] = out["Anomaly_Flag"]                       # 1 = normal, -1 = anomaly
+    out["anomaly_count"] = (out["raw_anomaly"] == -1).rolling(window=window, min_periods=1).sum()
+    out["persistent_alert"] = out["anomaly_count"] >= min_hits
+    return out
+# =========================================================================== #
+
+
 # --------------------------------------------------------------------------- #
 # 4. Diagnostics, economics, rule-based recommendations
 # --------------------------------------------------------------------------- #
@@ -218,7 +237,7 @@ def analyze(df: pd.DataFrame, tariff: float, cur: str):
 
 def alarm_status(df: pd.DataFrame):
     r = df.tail(24)
-    h, frac = float(r["Health_Smooth"].mean()), float((r["Anomaly_Flag"] == -1).mean())
+    h, frac = float(r["Health_Smooth"].mean()), float(r["persistent_alert"].mean())   # CHANGED: persistent only
     if h < 50 or frac > 0.5:
         return "CRITICAL", "#d62728"
     if h < 70 or frac > 0.2:
@@ -230,13 +249,13 @@ def alarm_status(df: pd.DataFrame):
 # 5. Streamlit dashboard
 # --------------------------------------------------------------------------- #
 def chart_approach(d: pd.DataFrame) -> go.Figure:
-    an = d[d["Anomaly_Flag"] == -1]
+    an = d[d["persistent_alert"]]          # CHANGED: isolated anomalies are treated as normal points
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=d.index, y=d["Cond_Approach_C"], name="Condenser Approach",
                              mode="lines", line=dict(color="#1f77b4", width=1.5)))
     fig.add_trace(go.Scatter(x=d.index, y=d["Approach_Expected"] + 1.5, name="Warning limit (baseline +1.5 °C)",
                              mode="lines", line=dict(color="orange", dash="dash", width=1.2)))
-    fig.add_trace(go.Scatter(x=an.index, y=an["Cond_Approach_C"], name="AI-detected anomaly", mode="markers",
+    fig.add_trace(go.Scatter(x=an.index, y=an["Cond_Approach_C"], name="Persistent anomaly (≥3 of last 5)", mode="markers",
                              marker=dict(color="red", size=7, symbol="circle")))
     fig.add_vrect(x0=d.index[0], x1=d.index[TRAIN_HOURS - 1], fillcolor="green", opacity=0.06,
                   line_width=0, annotation_text="Training baseline (healthy)", annotation_position="top left")
@@ -251,6 +270,9 @@ def chart_power_vib(d: pd.DataFrame) -> go.Figure:
                              line=dict(color="#17becf", width=1.3)), secondary_y=False)
     fig.add_trace(go.Scatter(x=d.index, y=d["Vibration_mm_s"], name="Bearing Vibration (mm/s)",
                              line=dict(color="#d62728", width=1.3)), secondary_y=True)
+    an = d[d["persistent_alert"]]          # NEW: same persistence rule as Chart 1
+    fig.add_trace(go.Scatter(x=an.index, y=an["Vibration_mm_s"], name="Persistent anomaly", mode="markers",
+                             marker=dict(color="red", size=7)), secondary_y=True)
     fig.update_yaxes(title_text="kW", secondary_y=False)
     fig.update_yaxes(title_text="mm/s", secondary_y=True)
     fig.update_layout(title="Compressor Power vs Bearing Vibration", height=400, hovermode="x unified",
@@ -270,6 +292,7 @@ def chart_health(d: pd.DataFrame) -> go.Figure:
 
 def main():
     st.set_page_config(page_title="Chiller Predictive Maintenance", page_icon="❄️", layout="wide")
+    banner = st.empty()    # NEW: reserved slot at the very top; filled below once data is loaded
     st.title("❄️ Centrifugal Chiller – Predictive Maintenance & Anomaly Detection")
     st.caption("District cooling asset health monitoring · Isolation Forest on thermodynamic features · "
                "Synthetic ASHRAE RP-1043-style telemetry")
@@ -289,7 +312,17 @@ def main():
     raw = generate_telemetry(int(capacity), int(seed))
     feat = engineer_features(raw, int(capacity))
     scored = run_anomaly_detection(feat, float(contamination))
+    scored = apply_persistence_filter(scored)                    # NEW: persistence filtering
     d, rep = analyze(scored, tariff, cur)
+
+    # NEW: hard-threshold fail-safe on the latest telemetry record (independent of the AI model)
+    latest = d.iloc[-1]
+    if latest["Cond_Approach_C"] > HARD_LIMIT_APPROACH_C or latest["Vibration_mm_s"] > HARD_LIMIT_VIBRATION:
+        with banner.container():
+            st.error("⚠️ CRITICAL HARD THRESHOLD BREACH: Immediate Physical Inspection Required.")
+            st.caption(f"Latest reading ({d.index[-1]:%Y-%m-%d %H:%M}): condenser approach "
+                       f"{latest['Cond_Approach_C']:.1f} °C (limit {HARD_LIMIT_APPROACH_C}), bearing vibration "
+                       f"{latest['Vibration_mm_s']:.1f} mm/s (limit {HARD_LIMIT_VIBRATION}).")
 
     status, color = alarm_status(d)
     now = d.iloc[-24:]
@@ -316,12 +349,13 @@ def main():
         st.subheader("🔧 Actionable Insights")
         for sev, msg in rep["insights"]:
             getattr(st, sev)(msg)
-        st.caption(f"Anomalous hours in last 24 h: {(now['Anomaly_Flag'] == -1).sum()} / 24")
+        st.caption(f"Persistent-alert hours in last 24 h: {int(now['persistent_alert'].sum())} / 24 "
+                   f"(raw model flags: {int((now['raw_anomaly'] == -1).sum())})")
 
     with st.expander("Engineered feature table & export"):
         cols = ["T_evap_in", "T_evap_out", "T_cond_in", "T_cond_out", "P_cond_kPa", "P_evap_kPa", "kW_power",
                 "Vibration_mm_s", "Cond_Approach_C", "dT_evap_C", "COP", "kW_per_TR", "Load_pct",
-                "Anomaly_Flag", "Health_Index"]
+                "raw_anomaly", "anomaly_count", "persistent_alert", "Health_Index"]
         st.dataframe(d[cols].round(3).tail(200), use_container_width=True)
         st.download_button("Download full dataset (CSV)", d[cols].round(4).to_csv().encode(),
                            "chiller_telemetry_scored.csv", "text/csv")
