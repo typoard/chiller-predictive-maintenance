@@ -1,364 +1,401 @@
 """
-District Cooling Centrifugal Chiller - Predictive Maintenance & Anomaly Detection MVP
-Run:  streamlit run chiller_predictive_maintenance_mvp.py
-Deps: pip install streamlit pandas numpy scikit-learn plotly
+Centrifugal Chiller Predictive Maintenance Dashboard  -  UAE climate edition
+=============================================================================
+Run:   streamlit run app.py
+Deps:  pip install streamlit pandas numpy scikit-learn plotly
 
-Modules (in order):
-  1. Synthetic data generator  (30 days hourly telemetry, fouling + bearing wear in last 5 days)
-  2. Feature engineering       (condenser approach, dT_evap, kW/TR, COP, lift)
-  3. Anomaly engine            (Isolation Forest trained on healthy baseline -> Asset Health Index)
-  4. Diagnostics & economics   (load-adjusted baselines, rule-based recommendations, $/day loss)
-  5. Streamlit dashboard
+PHYSICS & ARCHITECTURE
+----------------------
+* HARDWARE-AGNOSTIC: no water flow meter is used anywhere. Required controller points only:
+    T_amb, T_cond_out, T_evap_out, P_cond, P_evap, T_discharge, compressor current (A).
+* Cooling capacity (TR) is ESTIMATED with a refrigerant-side enthalpy balance:
+      W_elec  = sqrt(3) * V * I * PF                      [kW]   from compressor current
+      m_ref   = W_elec / (h2 - h1)                        [kg/s] compressor energy balance
+      Q_evap  = m_ref * (h1 - h4)                         [kW]   refrigerating effect
+      TR      = Q_evap / 3.517
+  h1 = sat. vapour @ T_sat_evap, h4 = sat. liquid @ T_sat_cond (isenthalpic expansion),
+  h2 = measured discharge state (T_discharge). Hermetic/semi-hermetic drive assumed, so motor heat
+  is rejected into the refrigerant and W_elec equals the enthalpy rise m_ref*(h2-h1).
+* Condenser approach  T_approach = T_sat_cond(P_cond) - T_cond_out   [degC]
+* Specific power     kW/TR = 3.517 * (h2 - h1) / (h1 - h4)
+* WEATHER NORMALISATION (ASHRAE Guideline 14 style, dynamic baseline instead of a fixed limit):
+      T_baseline(t) = 2.0 + 0.03 * (T_amb(t) - 25)        Warning = T_baseline + 1.5 degC
+  The kW/TR baseline is a first-principles "twin": same enthalpy model evaluated with healthy
+  approach and nominal isentropic efficiency at the CURRENT condenser/evaporator conditions.
+* ML: Isolation Forest trained on the healthy window, fed with WEATHER-NORMALISED residuals
+  (the T_amb-adjusted view of [T_approach, kW/TR, T_amb]). Raw T_amb is deliberately not a tree
+  input: an out-of-range heat wave would be "isolated" instantly and cause the very false
+  positive the normalisation is meant to remove.
+* Persistence filter: >= 3 anomaly flags in the last 5 steps. Hard trip: T_approach >= 5.5 degC.
 """
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from plotly.subplots import make_subplots
 from sklearn.ensemble import IsolationForest
 
 # --------------------------------------------------------------------------- #
 # Constants
 # --------------------------------------------------------------------------- #
-N_HOURS = 30 * 24                  # 30 days hourly
-FAULT_HOURS = 5 * 24               # anomalies injected in final 5 days
-TRAIN_HOURS = 25 * 24              # healthy baseline used for training
-CP_WATER = 4.186                   # kJ/kg.K
-KW_PER_TR = 3.517                  # 1 TR = 3.517 kW thermal
-DESIGN_DT_EVAP = 5.5               # K at full load
-# R-134a saturation fit: ln(P_kPa) = A - B / T_K   (accurate to ~1% for 0-50 C)
-SAT_A, SAT_B = 15.428, 2662.6
+KW_PER_TR = 3.517                 # 1 TR = 3.517 kW thermal
+SAT_A, SAT_B = 15.428, 2662.6     # R-134a fit: ln(P_kPa) = A - B/T_K  (~1 % error, 0-50 degC)
+CP_VAP_ISENT = 0.95               # kJ/kg.K, mean suction-vapour cp for isentropic lift estimate
+K_ISENT = 1.09                    # effective isentropic exponent of R-134a vapour
+CP_SUPERHEAT = 1.15               # kJ/kg.K, superheated vapour at condensing pressure
+ETA_IS_NOM = 0.80                 # healthy compressor isentropic efficiency (baseline twin)
+EVAP_APPROACH_NOM = 1.5           # K, healthy T_evap_out - T_sat_evap
+SUPPLY_V, POWER_FACTOR = 3300.0, 0.90   # MV motor supply (line-line V) and PF
+RATED_TR = 1000                   # used ONLY by the simulator to size the plant
 
-MODEL_FEATURES = ["Cond_Approach_C", "dT_evap_C", "kW_per_TR", "Vibration_mm_s",
-                  "kW_power", "P_cond_kPa", "P_evap_kPa", "Load_pct"]
+HOURS, TRAIN_H, FAULT_H = 21 * 24, 14 * 24, 5 * 24     # 21 d hourly: 14 d healthy, 5 d fault window
+WARN_MARGIN_C = 1.5               # dynamic warning = baseline + 1.5 degC
+HARD_TRIP_C = 5.5                 # absolute critical trip
+LEAK_DROP_C = 1.0                 # Type B: drop below baseline
+KW_ELEVATED_PCT = 2.0             # Type B: specific power above baseline
+PERSIST_WINDOW, PERSIST_HITS = 5, 3
+DEWA_TARIFF = 0.44                # AED/kWh default
+SEED = 42
 
-
-def p_sat_kpa(t_c):
-    """Refrigerant (R-134a) saturation pressure [kPa abs] from temperature [C]."""
-    return np.exp(SAT_A - SAT_B / (np.asarray(t_c) + 273.15))
-
-
-def t_sat_c(p_kpa):
-    """Refrigerant (R-134a) saturation temperature [C] from pressure [kPa abs]."""
-    return SAT_B / (SAT_A - np.log(np.asarray(p_kpa))) - 273.15
+SCENARIOS = ["Normal Operation", "Gradual Tube Fouling",
+             "Sudden Refrigerant Leak/Pressure Loss", "Extreme Weather Spike"]
 
 
 # --------------------------------------------------------------------------- #
-# 1. Synthetic data generator
+# R-134a thermodynamic helpers (compact correlations, adequate for MVP analytics)
+# --------------------------------------------------------------------------- #
+def p_sat(t_c):
+    """Saturation pressure [kPa abs] from saturation temperature [degC]."""
+    return np.exp(SAT_A - SAT_B / (np.asarray(t_c, dtype=float) + 273.15))
+
+
+def t_sat(p_kpa):
+    """Saturation temperature [degC] from pressure [kPa abs] (inverse of p_sat)."""
+    return SAT_B / (SAT_A - np.log(np.asarray(p_kpa, dtype=float))) - 273.15
+
+
+def h_liq(t_c):
+    """Saturated-liquid enthalpy [kJ/kg], IIR reference (200 kJ/kg at 0 degC)."""
+    return 200.0 + 1.34 * t_c + 0.00175 * t_c ** 2
+
+
+def h_vap(t_c):
+    """Saturated-vapour enthalpy [kJ/kg]."""
+    return 398.6 + 0.6 * t_c - 0.002 * t_c ** 2
+
+
+def dh_isentropic(tsc, tse):
+    """Isentropic enthalpy rise [kJ/kg]:  cp * T1 * (PR^((k-1)/k) - 1),  PR = P_cond / P_evap."""
+    pr = p_sat(tsc) / p_sat(tse)
+    return CP_VAP_ISENT * (tse + 273.15) * (pr ** ((K_ISENT - 1) / K_ISENT) - 1)
+
+
+def ideal_kw_per_tr(tsc, tse, eta):
+    """Specific power [kW/TR] of a compressor with isentropic efficiency `eta` between the
+    given saturation temperatures:  kW/TR = 3.517 * (dh_is/eta) / (h1 - h4)."""
+    return KW_PER_TR * (dh_isentropic(tsc, tse) / eta) / (h_vap(tse) - h_liq(tsc))
+
+
+# --------------------------------------------------------------------------- #
+# 1. Simulator  (raw controller points only - no flow, no capacity)
 # --------------------------------------------------------------------------- #
 @st.cache_data(show_spinner=False)
-def generate_telemetry(capacity_tr: int = 1000, seed: int = 42) -> pd.DataFrame:
+def simulate_telemetry(scenario: str, amb_lo: float, amb_hi: float, seed: int = SEED) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
-    n = N_HOURS
+    n = HOURS
     idx = pd.date_range(end=pd.Timestamp.now().floor("h"), periods=n, freq="h")
-    hour = idx.hour.values
-    i = np.arange(n)
+    i, hour = np.arange(n), idx.hour.values
+    f0 = n - FAULT_H                                            # start of fault window
 
-    # Cooling load fraction: diurnal profile (peak ~15:00) + smoothed noise
-    noise = pd.Series(rng.normal(0, 0.05, n)).rolling(3, min_periods=1).mean().values
-    load = np.clip(0.62 + 0.20 * np.sin(2 * np.pi * (hour - 9) / 24) + noise, 0.35, 1.0)
-    q_evap_kw = load * capacity_tr * KW_PER_TR
+    # Outdoor dry-bulb: user range as diurnal swing (peak 15:00) + slow weather drift
+    mid, amp = (amb_lo + amb_hi) / 2, (amb_hi - amb_lo) / 2
+    t_amb = (mid + amp * np.sin(2 * np.pi * (hour - 9) / 24)
+             + 0.8 * np.sin(2 * np.pi * i / (24 * 6)) + rng.normal(0, 0.3, n))
+    if scenario == "Extreme Weather Spike":                     # heat wave in the last 4 days
+        t_amb = np.minimum(t_amb + 7.0 * np.clip((i - (n - 96)) / 12, 0, 1), 50.0)
 
-    # Fault ramp (0 -> 1 across final 5 days)
-    ramp = np.clip((i - (n - FAULT_HOURS)) / FAULT_HOURS, 0, 1)
+    # Cooling load follows ambient (UAE: load is weather-driven)
+    load = np.clip(0.45 + 0.015 * (t_amb - 20) + rng.normal(0, 0.04, n), 0.35, 1.0)
 
-    # Evaporator water side
-    t_evap_out = 6.0 + rng.normal(0, 0.12, n)
-    dt_evap = DESIGN_DT_EVAP * load + rng.normal(0, 0.08, n)
-    t_evap_in = t_evap_out + dt_evap
+    # Cooling-tower water: wet-bulb ~ f(dry-bulb) + 4 K tower approach
+    t_cond_in = 14.0 + 0.35 * t_amb + 4.0 + rng.normal(0, 0.25, n)
+    t_cond_out = t_cond_in + 6.2 * load + rng.normal(0, 0.10, n)
+    t_evap_out = 6.0 + rng.normal(0, 0.10, n)
 
-    # Condenser water side (cooling-tower supply follows ambient)
-    t_cond_in = (29.5 + 2.5 * np.sin(2 * np.pi * (hour - 9) / 24)
-                 + 0.8 * np.sin(2 * np.pi * i / (24 * 9)) + rng.normal(0, 0.3, n))
-    t_cond_out = t_cond_in + 6.5 * load + rng.normal(0, 0.1, n)
+    # Fault injection -------------------------------------------------------
+    foul = 3.8 * np.clip((i - f0) / FAULT_H, 0, 1) if scenario == "Gradual Tube Fouling" else 0.0
+    leak = (i >= f0 + 12) if scenario == "Sudden Refrigerant Leak/Pressure Loss" else np.zeros(n, bool)
 
-    # Condenser approach (T_sat - T_cond_out): healthy ~1.5-2.5 K, fouling adds up to +3.2 K
-    approach = 1.3 + 1.2 * load + rng.normal(0, 0.12, n) + 3.2 * ramp ** 1.3
-    t_cond_sat = t_cond_out + approach
-    t_evap_sat = t_evap_out - 1.2 + rng.normal(0, 0.05, n)
+    # Healthy approach follows the specified weather curve; fouling adds, leak steps it down
+    approach = 2.0 + 0.03 * (t_amb - 25) + rng.normal(0, 0.12, n) + foul - 1.6 * leak
+    tsc = t_cond_out + approach                                              # true T_sat_cond
+    tse = t_evap_out - EVAP_APPROACH_NOM - 2.0 * leak + rng.normal(0, 0.05, n)  # true T_sat_evap
 
-    # Compressor efficiency = fraction of Carnot COP (fouling raises lift -> power rises naturally)
-    carnot = (t_evap_sat + 273.15) / (t_cond_sat - t_evap_sat)
-    eta = 0.60 + 0.10 * load + rng.normal(0, 0.008, n)
-    kw = q_evap_kw / (eta * carnot)
-    kw *= 1 + 0.02 * ramp                                   # extra bearing friction
-
-    # Refrigerant pressures from saturation temperatures
-    p_cond = p_sat_kpa(t_cond_sat) * (1 + rng.normal(0, 0.004, n))
-    p_evap = p_sat_kpa(t_evap_sat) * (1 + rng.normal(0, 0.004, n))
-
-    # Bearing vibration: baseline + progressive wear + intermittent spikes in fault window
-    vib = 1.8 + 0.9 * load + rng.normal(0, 0.12, n) + 0.9 * ramp
-    spikes = (rng.random(n) < 0.10) & (ramp > 0)
-    vib = vib + spikes * rng.uniform(1.2, 3.0, n) * (0.5 + ramp)
+    # Compressor: true efficiency (leak = poor charge -> degraded efficiency)
+    eta = ETA_IS_NOM + rng.normal(0, 0.004, n) - 0.06 * leak
+    dh_act = dh_isentropic(tsc, tse) / eta                                   # h2 - h1
+    q_ref = h_vap(tse) - h_liq(tsc)                                          # h1 - h4
+    q_kw = load * RATED_TR * KW_PER_TR                                       # true capacity
+    m_ref = q_kw / q_ref
+    w_kw = m_ref * dh_act                                                    # electrical input
+    amps = w_kw * 1000 / (np.sqrt(3) * SUPPLY_V * POWER_FACTOR) * (1 + rng.normal(0, 0.004, n))
+    t_dis = tsc + (h_vap(tse) + dh_act - h_vap(tsc)) / CP_SUPERHEAT + rng.normal(0, 0.15, n)
 
     return pd.DataFrame({
-        "timestamp": idx, "T_evap_in": t_evap_in, "T_evap_out": t_evap_out,
-        "T_cond_in": t_cond_in, "T_cond_out": t_cond_out,
-        "P_cond": p_cond, "P_evap": p_evap, "kW_power": kw, "Vibration_mm_s": vib,
-    }).set_index("timestamp")
+        "T_amb": t_amb, "T_cond_out": t_cond_out, "T_evap_out": t_evap_out,
+        "P_cond_kPa": p_sat(tsc) * (1 + rng.normal(0, 0.004, n)),
+        "P_evap_kPa": p_sat(tse) * (1 + rng.normal(0, 0.004, n)),
+        "T_discharge": t_dis, "Compressor_A": amps,
+    }, index=pd.Index(idx, name="timestamp"))
 
 
 # --------------------------------------------------------------------------- #
-# 2. Mechanical feature engineering
+# 2. Physics engine: capacity estimate, KPIs, weather-adjusted baselines
 # --------------------------------------------------------------------------- #
-def engineer_features(df: pd.DataFrame, capacity_tr: int) -> pd.DataFrame:
-    """Adds thermodynamic KPIs.
-    Condenser approach is defined conventionally as T_sat,cond - T_cond_out (>= 0 on a healthy
-    unit); T_sat,cond is derived from measured condenser refrigerant pressure."""
-    out = df.copy()
-    design_flow = capacity_tr * KW_PER_TR / (CP_WATER * DESIGN_DT_EVAP)   # kg/s (assumed constant)
+def physics_engine(raw: pd.DataFrame) -> pd.DataFrame:
+    d = raw.copy()
+    d["T_sat_cond"], d["T_sat_evap"] = t_sat(d["P_cond_kPa"]), t_sat(d["P_evap_kPa"])
 
-    out["T_sat_cond_C"] = t_sat_c(out["P_cond"])
-    out["T_sat_evap_C"] = t_sat_c(out["P_evap"])
-    out["Cond_Approach_C"] = out["T_sat_cond_C"] - out["T_cond_out"]
-    out["dT_evap_C"] = out["T_evap_in"] - out["T_evap_out"]
-    out["Lift_K"] = out["T_sat_cond_C"] - out["T_sat_evap_C"]
+    # Electrical input from compressor current (3-phase): P = sqrt(3) * V * I * PF
+    d["kW"] = np.sqrt(3) * SUPPLY_V * d["Compressor_A"] * POWER_FACTOR / 1000
 
-    out["Q_evap_kW"] = design_flow * CP_WATER * out["dT_evap_C"]
-    out["Cooling_TR"] = out["Q_evap_kW"] / KW_PER_TR
-    out["Load_frac"] = out["Cooling_TR"] / capacity_tr
-    out["Load_pct"] = out["Load_frac"] * 100
-    out["kW_per_TR"] = out["kW_power"] / out["Cooling_TR"]
-    out["COP"] = out["Q_evap_kW"] / out["kW_power"]
-    out.rename(columns={"P_cond": "P_cond_kPa", "P_evap": "P_evap_kPa"}, inplace=True)
+    # Enthalpy balance -> refrigerant mass flow -> cooling capacity (no flow meter)
+    h1, h4 = h_vap(d["T_sat_evap"]), h_liq(d["T_sat_cond"])
+    h2 = h_vap(d["T_sat_cond"]) + CP_SUPERHEAT * (d["T_discharge"] - d["T_sat_cond"])
+    d["m_ref_kg_s"] = d["kW"] / (h2 - h1)
+    d["TR_est"] = d["m_ref_kg_s"] * (h1 - h4) / KW_PER_TR
+    d["kW_per_TR"] = d["kW"] / d["TR_est"]
+
+    # Condenser approach: T_approach = T_sat_cond - T_cond_out
+    d["T_approach"] = d["T_sat_cond"] - d["T_cond_out"]
+
+    # Dynamic weather-adjusted baseline & warning threshold (Dr. Hamdan / ASHRAE G14)
+    d["T_baseline"] = 2.0 + 0.03 * (d["T_amb"] - 25.0)
+    d["T_warn"] = d["T_baseline"] + WARN_MARGIN_C
+
+    # Healthy specific-power twin at the CURRENT conditions (healthy approach, nominal efficiency)
+    d["kWTR_baseline"] = ideal_kw_per_tr(d["T_cond_out"] + d["T_baseline"],
+                                         d["T_evap_out"] - EVAP_APPROACH_NOM, ETA_IS_NOM)
+
+    # Weather-normalised residuals (what the ML model actually sees)
+    d["Approach_Resid"] = d["T_approach"] - d["T_baseline"]
+    d["kWTR_Resid_pct"] = (d["kW_per_TR"] / d["kWTR_baseline"] - 1) * 100
+
+    # Wasted power: Delta_kW = (actual kW/TR - baseline kW/TR) * estimated TR
+    d["Delta_kW"] = (d["kW_per_TR"] - d["kWTR_baseline"]) * d["TR_est"]
+    return d
+
+
+# --------------------------------------------------------------------------- #
+# 3. ML anomaly detection + persistence filter + fault disambiguation
+# --------------------------------------------------------------------------- #
+def detect_anomalies(d: pd.DataFrame, contamination: float = 0.01) -> pd.DataFrame:
+    out = d.copy()
+    feats = ["Approach_Resid", "kWTR_Resid_pct"]
+    model = IsolationForest(n_estimators=300, contamination=contamination, random_state=7)
+    model.fit(out.iloc[:TRAIN_H][feats])                         # healthy baseline only
+    out["raw_anomaly"] = model.predict(out[feats])               # 1 = normal, -1 = anomaly
+
+    # Persistence filter: >= 3 flags within the last 5 time-steps
+    out["anomaly_count"] = (out["raw_anomaly"] == -1).rolling(PERSIST_WINDOW, min_periods=1).sum()
+    out["persistent_alert"] = out["anomaly_count"] >= PERSIST_HITS
     return out
 
 
-# --------------------------------------------------------------------------- #
-# 3. AI anomaly detection engine
-# --------------------------------------------------------------------------- #
+def classify_faults(d: pd.DataFrame) -> pd.DataFrame:
+    out = d.copy()
+    r = out["Approach_Resid"].rolling(3, min_periods=1).mean()           # smoothed residual
+    approach_s = out["T_approach"].rolling(3, min_periods=1).mean()
+    kw_elevated = out["kWTR_Resid_pct"].rolling(3, min_periods=1).mean() > KW_ELEVATED_PCT
+
+    # TYPE A - scale/fouling: gradual positive trend (>0.3 degC rise over 24 h) above warning limit
+    rising = r.diff(24) > 0.3
+    type_a = out["persistent_alert"] & (approach_s > out["T_warn"]) & rising
+
+    # TYPE B - refrigerant leak: sudden negative STEP (>1 degC within 3 h) inside a below-baseline
+    # episode, residual now >1 degC below baseline, specific power still elevated
+    neg = r < -0.5
+    episode = (neg != neg.shift()).cumsum()
+    step_seen = (r.diff(3) <= -LEAK_DROP_C).astype(int).groupby(episode).cummax().astype(bool)
+    type_b = out["persistent_alert"] & (r < -LEAK_DROP_C) & kw_elevated & step_seen
+
+    out["fault_type"] = np.select([type_b, type_a], ["B", "A"], default="")
+    return out
+
+
 @st.cache_data(show_spinner=False)
-def run_anomaly_detection(feat: pd.DataFrame, contamination: float = 0.01, seed: int = 7) -> pd.DataFrame:
-    """Train Isolation Forest on healthy window, score full dataset.
-    Anomaly_Flag: -1 anomaly / 1 normal.  Health_Index: 0-100 %, 50 % == model decision boundary,
-    100 % == at/above the median healthy sample."""
-    train = feat.iloc[:TRAIN_HOURS][MODEL_FEATURES]
-    model = IsolationForest(n_estimators=300, contamination=contamination, random_state=seed)
-    model.fit(train)
+def run_pipeline(scenario: str, amb_lo: float, amb_hi: float, seed: int = SEED) -> pd.DataFrame:
+    return classify_faults(detect_anomalies(physics_engine(simulate_telemetry(scenario, amb_lo, amb_hi, seed))))
 
-    out = feat.copy()
-    out["Anomaly_Flag"] = model.predict(out[MODEL_FEATURES])
-    s = model.decision_function(out[MODEL_FEATURES])          # >0 normal, <0 anomalous
-    s_ref = max(float(np.median(model.decision_function(train))), 1e-6)
-    out["Anomaly_Score"] = s
-    out["Health_Index"] = np.clip(50 + 50 * s / s_ref, 0, 100)
-    out["Health_Smooth"] = out["Health_Index"].rolling(6, min_periods=1).mean()
+
+# --------------------------------------------------------------------------- #
+# 4. Financial engine  (AED, DEWA tariff)
+# --------------------------------------------------------------------------- #
+def add_financials(d: pd.DataFrame, tariff: float) -> pd.DataFrame:
+    out = d.copy()
+    # Daily Loss [AED/day] = Delta_kW * 24 h * tariff   (only positive = wasted energy is counted)
+    out["Loss_AED_day"] = np.clip(out["Delta_kW"], 0, None) * 24 * tariff
+    out["Loss_AED_day_s"] = out["Loss_AED_day"].rolling(6, min_periods=1).mean()
     return out
 
 
-# ===== NEW: persistence filter + hard fail-safe limits ===================== #
-PERSIST_WINDOW = 5          # look-back window (timestamps)
-PERSIST_MIN_HITS = 3        # anomalies required inside the window to raise an alert
-HARD_LIMIT_APPROACH_C = 5.5
-HARD_LIMIT_VIBRATION = 6.5  # mm/s
+def operational_status(d: pd.DataFrame):
+    last = d.iloc[-1]
+    if last["fault_type"] == "A":
+        return "Fouling Alert", "#e8590c"
+    if last["fault_type"] == "B":
+        return "Leak Alert", "#c2255c"
+    if last["persistent_alert"]:
+        return "Watch", "#f08c00"
+    return "Normal", "#2b9348"
 
 
-def apply_persistence_filter(df: pd.DataFrame, window: int = PERSIST_WINDOW,
-                             min_hits: int = PERSIST_MIN_HITS) -> pd.DataFrame:
-    """Noise reduction: an alert is only 'persistent' when >= min_hits of the last `window`
-    readings were flagged by the Isolation Forest. Isolated single anomalies stay False."""
-    out = df.copy()
-    out["raw_anomaly"] = out["Anomaly_Flag"]                       # 1 = normal, -1 = anomaly
-    out["anomaly_count"] = (out["raw_anomaly"] == -1).rolling(window=window, min_periods=1).sum()
-    out["persistent_alert"] = out["anomaly_count"] >= min_hits
-    return out
-# =========================================================================== #
-
-
-# --------------------------------------------------------------------------- #
-# 4. Diagnostics, economics, rule-based recommendations
-# --------------------------------------------------------------------------- #
-def _fit_baseline(healthy: pd.DataFrame, target: str, cols: list):
-    """Least-squares load/ambient-adjusted baseline fitted on healthy data."""
-    X = np.column_stack([np.ones(len(healthy))] + [healthy[c].values for c in cols])
-    beta = np.linalg.lstsq(X, healthy[target].values, rcond=None)[0]
-    sigma = float(np.std(healthy[target].values - X @ beta))
-
-    def predict(d):
-        return np.column_stack([np.ones(len(d))] + [d[c].values for c in cols]) @ beta
-    return predict, sigma
-
-
-def analyze(df: pd.DataFrame, tariff: float, cur: str):
-    d = df.copy()
-    healthy = d.iloc[:TRAIN_HOURS]
-    f_app, _ = _fit_baseline(healthy, "Cond_Approach_C", ["Load_frac"])
-    f_eff, _ = _fit_baseline(healthy, "kW_per_TR", ["Load_frac", "T_cond_in"])
-    f_vib, sig_vib = _fit_baseline(healthy, "Vibration_mm_s", ["Load_frac"])
-
-    d["Approach_Expected"] = f_app(d)
-    d["kWTR_Expected"] = f_eff(d)
-    d["Vib_Expected"] = f_vib(d)
-    d["Approach_Excess"] = d["Cond_Approach_C"] - d["Approach_Expected"]
-    d["Excess_kW"] = d["kW_power"] - d["kWTR_Expected"] * d["Cooling_TR"]
-
-    r = d.tail(24)                                           # "current" = last 24 h
-    loss_day = float(np.clip(r["Excess_kW"], 0, None).mean() * 24 * tariff)
-    app_ex = float(r["Approach_Excess"].mean())
-    eff_ex_pct = float((r["kW_per_TR"] / r["kWTR_Expected"] - 1).mean() * 100)
-    vib_ex = float((r["Vibration_mm_s"] - r["Vib_Expected"]).mean())
-    vib_spikes = int(((r["Vibration_mm_s"] - r["Vib_Expected"]) > 5 * sig_vib).sum())
-    vib_peak = float(r["Vibration_mm_s"].max())
-
-    insights = []
-    # --- Condenser fouling rule
-    if app_ex > 1.0:
-        slope_day = float(np.polyfit(np.arange(FAULT_HOURS), d["Approach_Excess"].tail(FAULT_HOURS).values, 1)[0] * 24)
-        limit = 3.0
-        if app_ex >= limit:
-            when = "immediately (within 3 days)"
-        elif slope_day > 0.05:
-            when = f"within {int(np.clip(np.floor((limit - app_ex) / slope_day), 3, 14))} days"
-        else:
-            when = "within 14 days"
-        sev = "error" if app_ex >= 2.5 else "warning"
-        insights.append((sev, f"{'CRITICAL' if sev == 'error' else 'Warning'}: Condenser approach temperature exceeds "
-                              f"load-adjusted baseline by +{app_ex:.1f} °C (trend {slope_day:+.2f} °C/day). "
-                              f"Schedule condenser tube descaling / brush cleaning {when} to prevent "
-                              f"~{cur} {loss_day:,.0f}/day efficiency loss. Verify cooling-tower water treatment."))
-    # --- Bearing wear rule
-    if vib_ex > 3 * sig_vib or vib_spikes >= 2:
-        sev = "error" if vib_peak >= 4.5 or vib_spikes >= 4 else "warning"
-        insights.append((sev, f"{'CRITICAL' if sev == 'error' else 'Warning'}: Compressor bearing vibration is "
-                              f"+{vib_ex:.2f} mm/s above baseline with {vib_spikes} spike(s) in the last 24 h "
-                              f"(peak {vib_peak:.1f} mm/s). Schedule vibration spectrum analysis and oil/bearing "
-                              f"inspection within 7 days; plan bearing replacement at next outage if spikes persist."))
-    # --- Efficiency rule
-    if eff_ex_pct > 4:
-        insights.append(("warning", f"Efficiency: kW/TR is {eff_ex_pct:.1f}% worse than the healthy baseline at the same "
-                                    f"load and condenser water temperature (avg {r['kW_per_TR'].mean():.3f} vs "
-                                    f"{r['kWTR_Expected'].mean():.3f} kW/TR)."))
-    if not insights:
-        insights.append(("success", "All monitored parameters are within load-adjusted healthy baselines. "
-                                    "Continue routine preventive maintenance."))
-    return d, {"loss_day": loss_day, "approach_excess": app_ex, "insights": insights}
-
-
-def alarm_status(df: pd.DataFrame):
-    r = df.tail(24)
-    h, frac = float(r["Health_Smooth"].mean()), float(r["persistent_alert"].mean())   # CHANGED: persistent only
-    if h < 50 or frac > 0.5:
-        return "CRITICAL", "#d62728"
-    if h < 70 or frac > 0.2:
-        return "WARNING", "#ff9900"
-    return "NORMAL", "#2ca02c"
+def build_insight(d: pd.DataFrame, tariff: float):
+    """Rule-based recommendation for the latest state -> (streamlit level, message)."""
+    last, tail = d.iloc[-1], d.tail(6)
+    loss = float(tail["Loss_AED_day"].mean())
+    resid = float(d["Approach_Resid"].tail(3).mean())
+    kw_pct = float(d["kWTR_Resid_pct"].tail(3).mean())
+    if last["fault_type"] == "A":
+        slope = float(np.polyfit(np.arange(48), d["T_approach"].tail(48).values, 1)[0] * 24)  # degC/day
+        cur = float(d["T_approach"].tail(3).mean())
+        days = 14 if slope <= 0.05 else int(np.clip(np.floor((HARD_TRIP_C - cur) / slope), 1, 14))
+        return "error" if cur >= HARD_TRIP_C - 1 else "warning", (
+            f"TYPE A - Condenser tube scale / fouling: approach is {resid:+.1f} °C vs the weather-adjusted "
+            f"baseline ({last['T_baseline']:.1f} °C at {last['T_amb']:.0f} °C ambient), trending {slope:+.2f} °C/day. "
+            f"Schedule tube descaling/brushing within {days} days to avoid reaching the {HARD_TRIP_C} °C trip "
+            f"and ~AED {loss:,.0f}/day of wasted energy. Check tower water treatment.")
+    if last["fault_type"] == "B":
+        return "error", (
+            f"TYPE B - Potential refrigerant leak / pressure drop: approach fell {abs(resid):.1f} °C below baseline "
+            f"while specific power is {kw_pct:+.1f}% above healthy. Verify refrigerant charge and subcooling, leak-test "
+            f"joints and seals, and inspect for low evaporator pressure. Current waste ~AED {loss:,.0f}/day.")
+    if last["persistent_alert"]:
+        return "info", ("Early drift detected by the model (persistent, below classification limits). "
+                        "Continue monitoring; no action required yet.")
+    return "success", (f"Operating within the weather-adjusted baseline (ambient {last['T_amb']:.0f} °C → expected "
+                       f"approach {last['T_baseline']:.2f} °C). Outdoor heat alone does not raise alerts.")
 
 
 # --------------------------------------------------------------------------- #
-# 5. Streamlit dashboard
+# 5. UI helpers
 # --------------------------------------------------------------------------- #
-def chart_approach(d: pd.DataFrame) -> go.Figure:
-    an = d[d["persistent_alert"]]          # CHANGED: isolated anomalies are treated as normal points
+CSS = """
+<style>
+.block-container{padding-top:1.2rem;padding-bottom:2rem;max-width:1200px}
+.kpi{border:1px solid rgba(128,128,128,.28);border-radius:14px;padding:14px 16px;
+     background:rgba(128,128,128,.07);margin-bottom:10px}
+.kpi .t{font-size:.74rem;letter-spacing:.05em;text-transform:uppercase;opacity:.72}
+.kpi .v{font-size:1.85rem;font-weight:700;line-height:1.2}
+.kpi .s{font-size:.82rem;opacity:.78}
+@media (max-width:640px){
+  .kpi .v{font-size:1.55rem}
+  h1{font-size:1.45rem !important}
+  .block-container{padding-left:.8rem;padding-right:.8rem}
+}
+</style>
+"""
+
+
+def kpi(title, value, sub, color):
+    return (f"<div class='kpi' style='border-left:6px solid {color}'><div class='t'>{title}</div>"
+            f"<div class='v' style='color:{color}'>{value}</div><div class='s'>{sub}</div></div>")
+
+
+def style_fig(fig, title, ytitle):
+    fig.update_layout(title=dict(text=title, font=dict(size=15)), height=360, hovermode="x unified",
+                      margin=dict(l=8, r=8, t=45, b=8), font=dict(size=12),
+                      yaxis_title=ytitle, legend=dict(orientation="h", yanchor="top", y=-0.18, x=0))
+    return fig
+
+
+def chart_approach(d):
+    pts = d[d["persistent_alert"]]                       # ONLY persistent alerts are drawn in red
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=d.index, y=d["Cond_Approach_C"], name="Condenser Approach",
-                             mode="lines", line=dict(color="#1f77b4", width=1.5)))
-    fig.add_trace(go.Scatter(x=d.index, y=d["Approach_Expected"] + 1.5, name="Warning limit (baseline +1.5 °C)",
-                             mode="lines", line=dict(color="orange", dash="dash", width=1.2)))
-    fig.add_trace(go.Scatter(x=an.index, y=an["Cond_Approach_C"], name="Persistent anomaly (≥3 of last 5)", mode="markers",
-                             marker=dict(color="red", size=7, symbol="circle")))
-    fig.add_vrect(x0=d.index[0], x1=d.index[TRAIN_HOURS - 1], fillcolor="green", opacity=0.06,
-                  line_width=0, annotation_text="Training baseline (healthy)", annotation_position="top left")
-    fig.update_layout(title="Condenser Approach Temperature", yaxis_title="°C", height=400,
-                      hovermode="x unified", margin=dict(t=50, b=20), legend=dict(orientation="h", y=-0.15))
-    return fig
+    fig.add_trace(go.Scatter(x=d.index, y=d["T_approach"], name="T_approach", mode="lines",
+                             line=dict(color="#1f77b4", width=1.6)))
+    fig.add_trace(go.Scatter(x=d.index, y=d["T_baseline"], name="Weather-adjusted baseline", mode="lines",
+                             line=dict(color="#2b9348", width=1.6, dash="dash")))
+    fig.add_trace(go.Scatter(x=d.index, y=d["T_warn"], name="Warning (baseline + 1.5 °C)", mode="lines",
+                             line=dict(color="#f08c00", width=1.6, dash="dash")))
+    fig.add_trace(go.Scatter(x=pts.index, y=pts["T_approach"], name="Persistent anomaly", mode="markers",
+                             marker=dict(color="red", size=7)))
+    fig.add_hline(y=HARD_TRIP_C, line_dash="dot", line_color="#d62728")
+    fig.add_vrect(x0=d.index[0], x1=d.index[TRAIN_H - 1], fillcolor="green", opacity=0.05, line_width=0)
+    return style_fig(fig, "Condenser Approach vs Weather-Adjusted Baseline", "°C")
 
 
-def chart_power_vib(d: pd.DataFrame) -> go.Figure:
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
-    fig.add_trace(go.Scatter(x=d.index, y=d["kW_power"], name="Compressor Power (kW)",
-                             line=dict(color="#17becf", width=1.3)), secondary_y=False)
-    fig.add_trace(go.Scatter(x=d.index, y=d["Vibration_mm_s"], name="Bearing Vibration (mm/s)",
-                             line=dict(color="#d62728", width=1.3)), secondary_y=True)
-    an = d[d["persistent_alert"]]          # NEW: same persistence rule as Chart 1
-    fig.add_trace(go.Scatter(x=an.index, y=an["Vibration_mm_s"], name="Persistent anomaly", mode="markers",
-                             marker=dict(color="red", size=7)), secondary_y=True)
-    fig.update_yaxes(title_text="kW", secondary_y=False)
-    fig.update_yaxes(title_text="mm/s", secondary_y=True)
-    fig.update_layout(title="Compressor Power vs Bearing Vibration", height=400, hovermode="x unified",
-                      margin=dict(t=50, b=20), legend=dict(orientation="h", y=-0.15))
-    return fig
+def chart_loss(d):
+    fig = go.Figure(go.Scatter(x=d.index, y=d["Loss_AED_day_s"], mode="lines", fill="tozeroy",
+                               name="Wasted energy (AED/day)", line=dict(color="#e8590c", width=1.6)))
+    return style_fig(fig, "Estimated Daily Financial Loss (6 h avg)", "AED / day")
 
 
-def chart_health(d: pd.DataFrame) -> go.Figure:
-    fig = go.Figure(go.Scatter(x=d.index, y=d["Health_Smooth"], fill="tozeroy", name="Health Index",
-                               line=dict(color="#2ca02c")))
-    fig.add_hline(y=70, line_dash="dash", line_color="orange")
-    fig.add_hline(y=50, line_dash="dash", line_color="red")
-    fig.update_layout(title="Asset Health Index (6 h smoothed)", yaxis=dict(range=[0, 100], title="%"),
-                      height=300, margin=dict(t=50, b=20))
-    return fig
-
-
+# --------------------------------------------------------------------------- #
+# 6. Streamlit app
+# --------------------------------------------------------------------------- #
 def main():
-    st.set_page_config(page_title="Chiller Predictive Maintenance", page_icon="❄️", layout="wide")
-    banner = st.empty()    # NEW: reserved slot at the very top; filled below once data is loaded
-    st.title("❄️ Centrifugal Chiller – Predictive Maintenance & Anomaly Detection")
-    st.caption("District cooling asset health monitoring · Isolation Forest on thermodynamic features · "
-               "Synthetic ASHRAE RP-1043-style telemetry")
+    st.set_page_config(page_title="Chiller Health - UAE", page_icon="❄️", layout="wide",
+                       initial_sidebar_state="auto")
+    st.markdown(CSS, unsafe_allow_html=True)
+    banner = st.empty()                      # reserved slot: critical banner always renders at the very top
+    st.title("❄️ Chiller Health Monitor")
+    st.caption("Centrifugal chiller · UAE climate · flow-meter-free capacity estimation · AED energy loss")
 
     with st.sidebar:
-        st.header("Configuration")
-        capacity = st.number_input("Chiller capacity (TR)", 300, 3000, 1000, 100)
-        cur = st.radio("Currency", ["AED", "USD"], horizontal=True)
-        tariff = st.number_input(f"Electricity tariff ({cur}/kWh)", 0.01, 2.0,
-                                 0.38 if cur == "AED" else 0.10, 0.01, key=f"tariff_{cur}")
-        contamination = st.slider("Model contamination (healthy false-alarm rate)", 0.005, 0.05, 0.01, 0.005)
-        seed = st.number_input("Simulation seed", 0, 9999, 42)
-        st.markdown("---")
-        st.caption(f"Training window: first {TRAIN_HOURS // 24} days (healthy). "
-                   f"Faults injected: last {FAULT_HOURS // 24} days.")
+        st.header("Controls")
+        amb_lo, amb_hi = st.slider("Outdoor ambient range (°C)", 20, 48, (30, 44))
+        scenario = st.radio("Simulation scenario", SCENARIOS, index=1)
+        tariff = st.slider("DEWA tariff (AED/kWh)", 0.20, 0.80, DEWA_TARIFF, 0.01)
+        st.caption(f"Training baseline: first {TRAIN_H // 24} days (healthy). "
+                   f"Fault window: last {FAULT_H // 24} days.")
 
-    raw = generate_telemetry(int(capacity), int(seed))
-    feat = engineer_features(raw, int(capacity))
-    scored = run_anomaly_detection(feat, float(contamination))
-    scored = apply_persistence_filter(scored)                    # NEW: persistence filtering
-    d, rep = analyze(scored, tariff, cur)
+    d = add_financials(run_pipeline(scenario, float(amb_lo), float(amb_hi)), tariff)
+    last = d.iloc[-1]
 
-    # NEW: hard-threshold fail-safe on the latest telemetry record (independent of the AI model)
-    latest = d.iloc[-1]
-    if latest["Cond_Approach_C"] > HARD_LIMIT_APPROACH_C or latest["Vibration_mm_s"] > HARD_LIMIT_VIBRATION:
+    # Critical hard trip - independent of the ML filter
+    if last["T_approach"] >= HARD_TRIP_C:
         with banner.container():
             st.error("⚠️ CRITICAL HARD THRESHOLD BREACH: Immediate Physical Inspection Required.")
-            st.caption(f"Latest reading ({d.index[-1]:%Y-%m-%d %H:%M}): condenser approach "
-                       f"{latest['Cond_Approach_C']:.1f} °C (limit {HARD_LIMIT_APPROACH_C}), bearing vibration "
-                       f"{latest['Vibration_mm_s']:.1f} mm/s (limit {HARD_LIMIT_VIBRATION}).")
+            st.caption(f"T_approach = {last['T_approach']:.1f} °C ≥ {HARD_TRIP_C} °C trip limit "
+                       f"({d.index[-1]:%Y-%m-%d %H:%M}).")
 
-    status, color = alarm_status(d)
-    now = d.iloc[-24:]
-    base_kwtr = d.iloc[:TRAIN_HOURS]["kW_per_TR"].mean()
+    status, scolor = operational_status(d)
+    app_now, base_now, warn_now = (d["T_approach"].tail(3).mean(), last["T_baseline"], last["T_warn"])
+    kwtr_now, kwtr_base = d["kW_per_TR"].tail(3).mean(), d["kWTR_baseline"].tail(3).mean()
+    loss_now = float(d["Loss_AED_day"].tail(6).mean())
+    wasted_kw = float(np.clip(d["Delta_kW"].tail(6), 0, None).mean())
+    app_color = "#d62728" if app_now >= warn_now else "#2b9348"
 
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Asset Health Index", f"{now['Health_Smooth'].mean():.0f} %",
-              delta=f"{now['Health_Smooth'].mean() - d.iloc[:TRAIN_HOURS]['Health_Smooth'].mean():.0f} pts vs baseline")
-    k2.metric("Efficiency (kW/TR)", f"{now['kW_per_TR'].mean():.3f}",
-              delta=f"{now['kW_per_TR'].mean() - base_kwtr:+.3f} vs healthy avg", delta_color="inverse")
-    k3.markdown("**Active Alarm Status**")
-    k3.markdown(f"<div style='font-size:2rem;font-weight:700;color:{color}'>● {status}</div>",
-                unsafe_allow_html=True)
-    k4.metric("Est. Financial Loss", f"{cur} {rep['loss_day']:,.0f} /day",
-              delta=f"≈ {cur} {rep['loss_day'] * 30:,.0f} / month", delta_color="off")
+    c1, c2 = st.columns(2)
+    c1.markdown(kpi("T_approach vs baseline", f"{app_now:.1f} °C",
+                    f"Baseline {base_now:.1f} °C · Warning {warn_now:.1f} °C · Δ {app_now - base_now:+.1f} °C",
+                    app_color), unsafe_allow_html=True)
+    c2.markdown(kpi("Current kW/TR", f"{kwtr_now:.3f}",
+                    f"Baseline {kwtr_base:.3f} · {(kwtr_now / kwtr_base - 1) * 100:+.1f}%",
+                    "#e8590c" if kwtr_now / kwtr_base > 1.04 else "#2b9348"), unsafe_allow_html=True)
+    c3, c4 = st.columns(2)
+    c3.markdown(kpi("Operational status", status,
+                    f"Ambient {last['T_amb']:.0f} °C · persistent alerts (24 h): {int(d['persistent_alert'].tail(24).sum())}",
+                    scolor), unsafe_allow_html=True)
+    c4.markdown(kpi("Daily financial waste", f"AED {loss_now:,.0f}/day",
+                    f"{wasted_kw:,.0f} kW wasted · tariff {tariff:.2f} AED/kWh",
+                    "#e8590c" if loss_now > 100 else "#2b9348"), unsafe_allow_html=True)
 
-    st.plotly_chart(chart_approach(d), use_container_width=True)
-    st.plotly_chart(chart_power_vib(d), use_container_width=True)
+    level, msg = build_insight(d, tariff)
+    getattr(st, level)(msg)
 
-    c1, c2 = st.columns([3, 2])
-    with c1:
-        st.plotly_chart(chart_health(d), use_container_width=True)
-    with c2:
-        st.subheader("🔧 Actionable Insights")
-        for sev, msg in rep["insights"]:
-            getattr(st, sev)(msg)
-        st.caption(f"Persistent-alert hours in last 24 h: {int(now['persistent_alert'].sum())} / 24 "
-                   f"(raw model flags: {int((now['raw_anomaly'] == -1).sum())})")
+    cfg = {"displayModeBar": False}
+    st.plotly_chart(chart_approach(d), config=cfg)
+    st.plotly_chart(chart_loss(d), config=cfg)
 
-    with st.expander("Engineered feature table & export"):
-        cols = ["T_evap_in", "T_evap_out", "T_cond_in", "T_cond_out", "P_cond_kPa", "P_evap_kPa", "kW_power",
-                "Vibration_mm_s", "Cond_Approach_C", "dT_evap_C", "COP", "kW_per_TR", "Load_pct",
-                "raw_anomaly", "anomaly_count", "persistent_alert", "Health_Index"]
-        st.dataframe(d[cols].round(3).tail(200), use_container_width=True)
-        st.download_button("Download full dataset (CSV)", d[cols].round(4).to_csv().encode(),
-                           "chiller_telemetry_scored.csv", "text/csv")
+    st.caption(f"Estimated load {last['TR_est']:,.0f} TR from compressor current "
+               f"({last['Compressor_A']:.0f} A) + refrigerant enthalpy balance - no flow meter used.")
+    with st.expander("Data & model internals"):
+        cols = ["T_amb", "T_approach", "T_baseline", "T_warn", "kW", "TR_est", "kW_per_TR", "kWTR_baseline",
+                "Delta_kW", "Loss_AED_day", "raw_anomaly", "anomaly_count", "persistent_alert", "fault_type"]
+        st.dataframe(d[cols].round(3).tail(200))
+        st.download_button("Download dataset (CSV)", d[cols].round(4).to_csv().encode(),
+                           "chiller_scored.csv", "text/csv")
 
 
 if __name__ == "__main__":
