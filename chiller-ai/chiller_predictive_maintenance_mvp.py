@@ -350,18 +350,25 @@ def main():
             cm_df = pd.DataFrame(cm, index=["True Healthy", "True Fouling", "True Leak"], columns=["Pred Healthy", "Pred Fouling", "Pred Leak"])
             st.dataframe(cm_df)
 
-    # ----------------------------------------------------------------------- #
-    # TAB 3: BMS CSV Audit Ingestion
+# ----------------------------------------------------------------------- #
+    # TAB 3: BMS File Audit Ingestion
     # ----------------------------------------------------------------------- #
     with tabs[2]:
         st.subheader("📁 Zero-Risk BMS Log File Audit")
-        st.write("Upload a 30-day raw BMS CSV log to generate an executive Thermal Efficiency & Financial Loss Report.")
-        uploaded_file = st.file_uploader("Upload BMS Log CSV", type=["csv"])
+        st.write("Upload a raw BMS log (CSV or Excel) to run the dynamic physics audit.")
+        
+        uploaded_file = st.file_uploader("Upload BMS Log File", type=["csv", "xlsx", "xls"])
         
         if uploaded_file is not None:
-            user_df = pd.read_csv(uploaded_file)
-            st.success("File ingested successfully! Processing physics & anomaly model...")
-            st.dataframe(user_df.head())
+            try:
+                if uploaded_file.name.endswith('.csv'):
+                    user_df = pd.read_csv(uploaded_file)
+                else:
+                    user_df = pd.read_excel(uploaded_file)
+                st.success("File ingested successfully!")
+                st.dataframe(user_df.head())
+            except Exception as e:
+                st.error(f"Error reading file: {e}")
 
 
 if __name__ == "__main__":
