@@ -12,6 +12,37 @@ import streamlit as st
 from sklearn.ensemble import IsolationForest
 from sklearn.metrics import classification_report, confusion_matrix
 
+def normalize_bms_columns(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """Automatically maps raw BMS or ASHRAE RP-1043 column names & converts units if needed."""
+    d = raw_df.copy()
+    cols = {str(c).strip(): c for c in d.columns}
+    
+    # Check for ASHRAE RP-1043 Format (Fahrenheit & psia)
+    if 'TCI' in cols and 'TCO' in cols and 'TEO' in cols:
+        out = pd.DataFrame(index=d.index)
+        # Convert °F to °C: (T - 32) * 5/9
+        out['T_amb'] = (d[cols['TCI']] - 32.0) * 5.0 / 9.0
+        out['T_cond_out'] = (d[cols['TCO']] - 32.0) * 5.0 / 9.0
+        out['T_evap_out'] = (d[cols['TEO']] - 32.0) * 5.0 / 9.0
+        
+        # Discharge Temperature
+        dis_col = cols.get('TR_dis', cols.get('T_dis', None))
+        if dis_col is not None:
+            out['T_discharge'] = (d[dis_col] - 32.0) * 5.0 / 9.0
+        else:
+            out['T_discharge'] = out['T_cond_out'] + 15.0
+            
+        # Convert psia to kPa: psia * 6.89476
+        out['P_cond_kPa'] = d[cols['PRC']] * 6.89476
+        out['P_evap_kPa'] = d[cols['PRE']] * 6.89476
+        
+        # Compressor Current
+        amps_col = cols.get('Amps', cols.get('Compressor_A', None))
+        out['Compressor_A'] = d[amps_col] if amps_col else 60.0
+        return out.dropna()
+        
+    return d
+
 # --------------------------------------------------------------------------- #
 # Constants & Constants
 # --------------------------------------------------------------------------- #
@@ -363,29 +394,31 @@ def main():
             try:
                 # File loader with format fallbacks
                 if uploaded_file.name.lower().endswith('.csv'):
-                    user_df = pd.read_csv(uploaded_file)
+                    user_raw = pd.read_csv(uploaded_file)
                 else:
                     try:
-                        user_df = pd.read_excel(uploaded_file, engine='openpyxl')
+                        user_raw = pd.read_excel(uploaded_file, engine='openpyxl')
                     except Exception:
                         uploaded_file.seek(0)
                         try:
-                            user_df = pd.read_excel(uploaded_file)
+                            user_raw = pd.read_excel(uploaded_file)
                         except Exception:
                             uploaded_file.seek(0)
-                            user_df = pd.read_csv(uploaded_file)
+                            user_raw = pd.read_csv(uploaded_file)
 
-                st.success("File ingested successfully!")
+                # Normalize column names & convert units automatically
+                user_df = normalize_bms_columns(user_raw)
                 
-                # Check for required physics columns
                 required_cols = ["T_amb", "T_cond_out", "T_evap_out", "P_cond_kPa", "P_evap_kPa", "T_discharge", "Compressor_A"]
                 missing = [col for col in required_cols if col not in user_df.columns]
                 
                 if not missing:
+                    st.success("File ingested and normalized successfully!")
+                    
                     # Run physics and financial processing
                     audited_df = add_financials(classify_faults(detect_anomalies(physics_engine(user_df))), DEWA_TARIFF)
                     last_audit = audited_df.iloc[-1]
-                    total_waste = audited_df["Loss_AED_day"].sum() / 24 # Total period waste estimate
+                    total_waste = audited_df["Loss_AED_day"].sum() / 24
                     
                     st.markdown("---")
                     st.subheader("📊 Executive Audit Results")
@@ -393,7 +426,7 @@ def main():
                     col_a1, col_a2, col_a3 = st.columns(3)
                     col_a1.metric("Audit Period Waste", f"AED {total_waste:,.0f}")
                     col_a2.metric("Latest Daily Waste Rate", f"AED {last_audit['Loss_AED_day']:,.0f}/day")
-                    col_a3.metric("Detected Fault Type", last_audit["fault_type"] if last_audit["fault_type"] else "None (Healthy)")
+                    col_a3.metric("Detected Fault Type", last_audit["fault_type"] if last_audit["fault_type"] else "Normal / Healthy")
                     
                     # Display approach vs weather baseline chart
                     fig_audit = go.Figure()
@@ -401,11 +434,10 @@ def main():
                     fig_audit.add_trace(go.Scatter(y=audited_df["T_baseline"], name="Weather Baseline (°C)", mode="lines", line=dict(dash="dash")))
                     st.plotly_chart(style_fig(fig_audit, "BMS Audit: Approach vs Weather Baseline", "°C"), config={"displayModeBar": False})
                     
-                    # Download processed audit result
-                    st.download_button("Download Audit Report (CSV)", audited_df.to_csv().encode(), "BMS_Audit_Report.csv", "text/csv")
+                    st.download_button("Download Scored Audit (CSV)", audited_df.to_csv().encode(), "BMS_Audit_Report.csv", "text/csv")
                 else:
-                    st.warning(f"File uploaded, but missing required sensor columns for full physics calculations: {missing}")
-                    st.dataframe(user_df.head())
+                    st.warning(f"File uploaded, but missing required sensor columns: {missing}")
+                    st.dataframe(user_raw.head())
                     
             except Exception as e:
                 st.error(f"Error processing file: {e}")
