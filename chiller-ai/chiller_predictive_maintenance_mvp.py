@@ -18,7 +18,7 @@ def normalize_bms_columns(raw_df: pd.DataFrame) -> pd.DataFrame:
     d = raw_df.copy()
     cols = {str(c).strip(): c for c in d.columns}
 
-    # Check for ASHRAE RP-1043 Format (Fahrenheit & psia)
+    # Check for ASHRAE RP-1043 Format (Fahrenheit & psig)
     if 'TCI' in cols and 'TCO' in cols and 'TEO' in cols:
         out = pd.DataFrame(index=d.index)
         # Convert °F to °C: (T - 32) * 5/9
@@ -33,9 +33,9 @@ def normalize_bms_columns(raw_df: pd.DataFrame) -> pd.DataFrame:
         else:
             out['T_discharge'] = out['T_cond_out'] + 15.0
 
-        # Convert psia to kPa: psia * 6.89476
-        out['P_cond_kPa'] = d[cols['PRC']] * 6.89476
-        out['P_evap_kPa'] = d[cols['PRE']] * 6.89476
+        # Convert psig (gauge) to kPa absolute: (psig + 14.696) * 6.89476
+        out['P_cond_kPa'] = (d[cols['PRC']] + 14.696) * 6.89476
+        out['P_evap_kPa'] = (d[cols['PRE']] + 14.696) * 6.89476
 
         # Compressor Current
         amps_col = cols.get('Amps', cols.get('Compressor_A', None))
@@ -434,7 +434,7 @@ def main():
                             uploaded_file.seek(0)
                             user_raw = pd.read_csv(uploaded_file)
 
-                # Normalize column names & convert units automatically
+                # Normalize column names & convert units automatically (including psig -> kPa abs fix)
                 user_df = normalize_bms_columns(user_raw)
 
                 required_cols = ["T_amb", "T_cond_out", "T_evap_out", "P_cond_kPa", "P_evap_kPa", "T_discharge", "Compressor_A"]
