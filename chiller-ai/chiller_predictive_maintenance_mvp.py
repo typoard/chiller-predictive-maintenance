@@ -361,11 +361,10 @@ def main():
         
         if uploaded_file is not None:
             try:
-                # 1. Direct CSV upload
+                # File loader with format fallbacks
                 if uploaded_file.name.lower().endswith('.csv'):
                     user_df = pd.read_csv(uploaded_file)
                 else:
-                    # 2. Excel upload with automatic fallbacks for misnamed files
                     try:
                         user_df = pd.read_excel(uploaded_file, engine='openpyxl')
                     except Exception:
@@ -377,9 +376,39 @@ def main():
                             user_df = pd.read_csv(uploaded_file)
 
                 st.success("File ingested successfully!")
-                st.dataframe(user_df.head())
+                
+                # Check for required physics columns
+                required_cols = ["T_amb", "T_cond_out", "T_evap_out", "P_cond_kPa", "P_evap_kPa", "T_discharge", "Compressor_A"]
+                missing = [col for col in required_cols if col not in user_df.columns]
+                
+                if not missing:
+                    # Run physics and financial processing
+                    audited_df = add_financials(classify_faults(detect_anomalies(physics_engine(user_df))), DEWA_TARIFF)
+                    last_audit = audited_df.iloc[-1]
+                    total_waste = audited_df["Loss_AED_day"].sum() / 24 # Total period waste estimate
+                    
+                    st.markdown("---")
+                    st.subheader("📊 Executive Audit Results")
+                    
+                    col_a1, col_a2, col_a3 = st.columns(3)
+                    col_a1.metric("Audit Period Waste", f"AED {total_waste:,.0f}")
+                    col_a2.metric("Latest Daily Waste Rate", f"AED {last_audit['Loss_AED_day']:,.0f}/day")
+                    col_a3.metric("Detected Fault Type", last_audit["fault_type"] if last_audit["fault_type"] else "None (Healthy)")
+                    
+                    # Display approach vs weather baseline chart
+                    fig_audit = go.Figure()
+                    fig_audit.add_trace(go.Scatter(y=audited_df["T_approach"], name="T_approach (°C)", mode="lines"))
+                    fig_audit.add_trace(go.Scatter(y=audited_df["T_baseline"], name="Weather Baseline (°C)", mode="lines", line=dict(dash="dash")))
+                    st.plotly_chart(style_fig(fig_audit, "BMS Audit: Approach vs Weather Baseline", "°C"), config={"displayModeBar": False})
+                    
+                    # Download processed audit result
+                    st.download_button("Download Audit Report (CSV)", audited_df.to_csv().encode(), "BMS_Audit_Report.csv", "text/csv")
+                else:
+                    st.warning(f"File uploaded, but missing required sensor columns for full physics calculations: {missing}")
+                    st.dataframe(user_df.head())
+                    
             except Exception as e:
-                st.error(f"Error reading file: {e}")
+                st.error(f"Error processing file: {e}")
 
 
 if __name__ == "__main__":
