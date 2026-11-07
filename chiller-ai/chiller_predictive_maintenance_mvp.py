@@ -61,8 +61,8 @@ RATED_TR = 1000                   # Plant rated capacity
 HOURS, TRAIN_H, FAULT_H = 21 * 24, 14 * 24, 5 * 24     # 21 d hourly window
 WARN_MARGIN_C = 1.5               # dynamic warning = baseline + 1.5 degC
 HARD_TRIP_C = 5.5                 # absolute critical trip
-LEAK_DROP_C = 1.0                 # Type B drop below baseline
-KW_ELEVATED_PCT = 2.0             # Type B specific power threshold
+LEAK_DROP_C = 1.2                 # Type B drop below baseline
+KW_ELEVATED_PCT = 10.0            # Type B specific power threshold
 PERSIST_WINDOW, PERSIST_HITS = 5, 3
 DEWA_TARIFF = 0.44                # AED/kWh default
 SEED = 42
@@ -212,20 +212,15 @@ def detect_anomalies(d: pd.DataFrame, contamination: float = 0.01) -> pd.DataFra
 
 
 def classify_faults(d: pd.DataFrame) -> pd.DataFrame:
+    """First-principles ASHRAE classifier ensuring robust detection on raw BMS logs."""
     out = d.copy()
-    r = out["Approach_Resid"].rolling(3, min_periods=1).mean()
-    approach_s = out["T_approach"].rolling(3, min_periods=1).mean()
-    kw_elevated = out["kWTR_Resid_pct"].rolling(3, min_periods=1).mean() > KW_ELEVATED_PCT
+    active = out["Compressor_A"] > 5.0
 
-    # Type A: Tube Fouling (Catches continuous 24h drift OR steady-state step shifts > T_warn + 0.5°C)
-    rising = (r.diff(24) > 0.3) | (r.diff(3) > 0.2)
-    type_a = out["persistent_alert"] & (approach_s > out["T_warn"]) & (rising | (approach_s > out["T_warn"] + 0.5))
+    # Type A: Condenser Tube Fouling (Approach temperature sits continuously at/above dynamic warning boundary)
+    type_a = active & (out["T_approach"] >= out["T_warn"])
 
-    # Type B: Refrigerant Leak
-    neg = r < -0.5
-    episode = (neg != neg.shift()).cumsum()
-    step_seen = (r.diff(3) <= -LEAK_DROP_C).astype(int).groupby(episode).cummax().astype(bool)
-    type_b = out["persistent_alert"] & (r < -LEAK_DROP_C) & kw_elevated & step_seen
+    # Type B: Refrigerant Leak (Approach drops >1.2°C below baseline while specific power is elevated >10%)
+    type_b = active & (out["Approach_Resid"] < -LEAK_DROP_C) & (out["kWTR_Resid_pct"] > KW_ELEVATED_PCT)
 
     out["fault_type"] = np.select([type_b, type_a], ["B", "A"], default="")
     return out
@@ -424,15 +419,15 @@ def main():
                 if not missing:
                     st.success("File ingested and normalized successfully!")
 
-                    audited_df = add_financials(classify_faults(detect_anomalies(physics_engine(user_df))), DEWA_TARIFF)
+                    audited_df = add_financials(classify_faults(physics_engine(user_df)), DEWA_TARIFF)
 
-                    # Filter active rows
+                    # Active load rows
                     active_df = audited_df[audited_df["Compressor_A"] > 5.0]
-                    
-                    # Audit-level Fault Summarizer across ENTIRE file
+
+                    # Audit-level Fault Summarizer across dataset
                     type_a_count = int((active_df["fault_type"] == "A").sum())
                     type_b_count = int((active_df["fault_type"] == "B").sum())
-                    
+
                     if type_a_count > 0 and type_a_count >= type_b_count:
                         overall_fault = f"Tube Fouling (Type A) Detected ({type_a_count} hrs)"
                     elif type_b_count > 0:
