@@ -364,7 +364,7 @@ def main():
                 if uploaded_file.name.endswith('.csv'):
                     user_df = pd.read_csv(uploaded_file)
                 else:
-                    user_df = pd.read_excel(uploaded_file)
+                    user_df = pd.read_excel(uploaded_file, engine='openpyxl')
                 st.success("File ingested successfully!")
                 st.dataframe(user_df.head())
             except Exception as e:
