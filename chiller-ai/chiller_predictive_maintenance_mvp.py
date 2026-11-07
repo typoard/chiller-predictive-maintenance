@@ -361,10 +361,21 @@ def main():
         
         if uploaded_file is not None:
             try:
-                if uploaded_file.name.endswith('.csv'):
+                # 1. Direct CSV upload
+                if uploaded_file.name.lower().endswith('.csv'):
                     user_df = pd.read_csv(uploaded_file)
                 else:
-                    user_df = pd.read_excel(uploaded_file, engine='openpyxl')
+                    # 2. Excel upload with automatic fallbacks for misnamed files
+                    try:
+                        user_df = pd.read_excel(uploaded_file, engine='openpyxl')
+                    except Exception:
+                        uploaded_file.seek(0)
+                        try:
+                            user_df = pd.read_excel(uploaded_file)
+                        except Exception:
+                            uploaded_file.seek(0)
+                            user_df = pd.read_csv(uploaded_file)
+
                 st.success("File ingested successfully!")
                 st.dataframe(user_df.head())
             except Exception as e:
