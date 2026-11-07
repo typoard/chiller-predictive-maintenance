@@ -2,7 +2,7 @@
 Centrifugal Chiller Predictive Maintenance & Benchmark Engine — UAE Climate Edition
 ===================================================================================
 Run:  streamlit run app.py
-Deps: pip install streamlit pandas numpy scikit-learn plotly
+Deps: pip install streamlit pandas numpy scikit-learn plotly openpyxl python-calamine
 """
 
 import numpy as np
@@ -12,11 +12,12 @@ import streamlit as st
 from sklearn.ensemble import IsolationForest
 from sklearn.metrics import classification_report, confusion_matrix
 
+
 def normalize_bms_columns(raw_df: pd.DataFrame) -> pd.DataFrame:
     """Automatically maps raw BMS or ASHRAE RP-1043 column names & converts units if needed."""
     d = raw_df.copy()
     cols = {str(c).strip(): c for c in d.columns}
-    
+
     # Check for ASHRAE RP-1043 Format (Fahrenheit & psia)
     if 'TCI' in cols and 'TCO' in cols and 'TEO' in cols:
         out = pd.DataFrame(index=d.index)
@@ -24,27 +25,28 @@ def normalize_bms_columns(raw_df: pd.DataFrame) -> pd.DataFrame:
         out['T_amb'] = (d[cols['TCI']] - 32.0) * 5.0 / 9.0
         out['T_cond_out'] = (d[cols['TCO']] - 32.0) * 5.0 / 9.0
         out['T_evap_out'] = (d[cols['TEO']] - 32.0) * 5.0 / 9.0
-        
+
         # Discharge Temperature
         dis_col = cols.get('TR_dis', cols.get('T_dis', None))
         if dis_col is not None:
             out['T_discharge'] = (d[dis_col] - 32.0) * 5.0 / 9.0
         else:
             out['T_discharge'] = out['T_cond_out'] + 15.0
-            
+
         # Convert psia to kPa: psia * 6.89476
         out['P_cond_kPa'] = d[cols['PRC']] * 6.89476
         out['P_evap_kPa'] = d[cols['PRE']] * 6.89476
-        
+
         # Compressor Current
         amps_col = cols.get('Amps', cols.get('Compressor_A', None))
         out['Compressor_A'] = d[amps_col] if amps_col else 60.0
         return out.dropna()
-        
+
     return d
 
+
 # --------------------------------------------------------------------------- #
-# Constants & Constants
+# Constants
 # --------------------------------------------------------------------------- #
 KW_PER_TR = 3.517                 # 1 TR = 3.517 kW thermal
 SAT_A, SAT_B = 15.428, 2662.6     # R-134a fit: ln(P_kPa) = A - B/T_K (~1 % error, 0-50 degC)
@@ -66,9 +68,9 @@ DEWA_TARIFF = 0.44                # AED/kWh default
 SEED = 42
 
 SCENARIOS = [
-    "Normal Operation", 
+    "Normal Operation",
     "Gradual Tube Fouling",
-    "Sudden Refrigerant Leak/Pressure Loss", 
+    "Sudden Refrigerant Leak/Pressure Loss",
     "Extreme Weather Spike"
 ]
 
@@ -117,7 +119,7 @@ def simulate_telemetry(scenario: str, season: str = "Summer (Peak Load)", seed: 
 
     t_amb = (amb_mid + amb_amp * np.sin(2 * np.pi * (hour - 9) / 24)
              + 0.8 * np.sin(2 * np.pi * i / (24 * 6)) + rng.normal(0, 0.3, n))
-    
+
     if scenario == "Extreme Weather Spike":
         t_amb = np.minimum(t_amb + 7.0 * np.clip((i - (n - 96)) / 12, 0, 1), 50.0)
 
@@ -160,26 +162,50 @@ def physics_engine(raw: pd.DataFrame) -> pd.DataFrame:
     d = raw.copy()
     d["T_sat_cond"], d["T_sat_evap"] = t_sat(d["P_cond_kPa"]), t_sat(d["P_evap_kPa"])
 
-    # Enthalpy-based capacity estimation without flow meters
-    d["kW"] = np.sqrt(3) * SUPPLY_V * d["Compressor_A"] * POWER_FACTOR / 1000
+    # Auto-detect voltage standard if not explicitly set (460V for lab/commercial, 3300V for MV district plant)
+    max_amps = d["Compressor_A"].max() if len(d) > 0 else 0
+    v_supply = 460.0 if max_amps < 150 else SUPPLY_V
+
+    # Compressor electrical power input
+    d["kW"] = np.sqrt(3) * v_supply * d["Compressor_A"] * POWER_FACTOR / 1000
+
+    # Refrigerant enthalpy balance
     h1, h4 = h_vap(d["T_sat_evap"]), h_liq(d["T_sat_cond"])
     h2 = h_vap(d["T_sat_cond"]) + CP_SUPERHEAT * (d["T_discharge"] - d["T_sat_cond"])
-    d["m_ref_kg_s"] = d["kW"] / (h2 - h1)
+    dh_act = np.maximum(h2 - h1, 1.0)
+
+    # Protect mass flow & estimated TR when compressor is off (Amps <= 0.5)
+    d["m_ref_kg_s"] = np.where(d["Compressor_A"] > 0.5, d["kW"] / dh_act, 0.0)
     d["TR_est"] = d["m_ref_kg_s"] * (h1 - h4) / KW_PER_TR
-    d["kW_per_TR"] = d["kW"] / d["TR_est"]
 
+    # Safe kW/TR calculation (prevents NaN / division by zero on idle)
+    d["kW_per_TR"] = np.where(d["TR_est"] > 0.1, d["kW"] / d["TR_est"], 0.0)
+
+    # Condenser approach & ASHRAE Guideline 14 dynamic weather baseline
     d["T_approach"] = d["T_sat_cond"] - d["T_cond_out"]
-
-    # ASHRAE Guideline 14 dynamic weather baseline
     d["T_baseline"] = 2.0 + 0.03 * (d["T_amb"] - 25.0)
     d["T_warn"] = d["T_baseline"] + WARN_MARGIN_C
 
-    d["kWTR_baseline"] = ideal_kw_per_tr(d["T_cond_out"] + d["T_baseline"],
-                                         d["T_evap_out"] - EVAP_APPROACH_NOM, ETA_IS_NOM)
+    # Baseline specific power twin
+    d["kWTR_baseline"] = ideal_kw_per_tr(
+        d["T_cond_out"] + d["T_baseline"],
+        d["T_evap_out"] - EVAP_APPROACH_NOM,
+        ETA_IS_NOM
+    )
 
     d["Approach_Resid"] = d["T_approach"] - d["T_baseline"]
-    d["kWTR_Resid_pct"] = (d["kW_per_TR"] / d["kWTR_baseline"] - 1) * 100
-    d["Delta_kW"] = (d["kW_per_TR"] - d["kWTR_baseline"]) * d["TR_est"]
+    d["kWTR_Resid_pct"] = np.where(
+        (d["kWTR_baseline"] > 0) & (d["TR_est"] > 0.1),
+        (d["kW_per_TR"] / d["kWTR_baseline"] - 1) * 100,
+        0.0
+    )
+
+    # Wasted power (only computed when compressor is running under load)
+    d["Delta_kW"] = np.where(
+        d["TR_est"] > 0.1,
+        (d["kW_per_TR"] - d["kWTR_baseline"]) * d["TR_est"],
+        0.0
+    )
     return d
 
 
@@ -188,9 +214,10 @@ def detect_anomalies(d: pd.DataFrame, contamination: float = 0.01) -> pd.DataFra
     feats = ["Approach_Resid", "kWTR_Resid_pct"]
     model = IsolationForest(n_estimators=300, contamination=contamination, random_state=7)
     train_limit = min(TRAIN_H, len(out) // 2)
+    train_limit = max(train_limit, 10)
     model.fit(out.iloc[:train_limit][feats])
     out["raw_anomaly"] = model.predict(out[feats])
-    
+
     # 3-of-5 Persistence Filter
     out["anomaly_count"] = (out["raw_anomaly"] == -1).rolling(PERSIST_WINDOW, min_periods=1).sum()
     out["persistent_alert"] = out["anomaly_count"] >= PERSIST_HITS
@@ -223,8 +250,9 @@ def run_pipeline(scenario: str, season: str, seed: int = SEED) -> pd.DataFrame:
 
 def add_financials(d: pd.DataFrame, tariff: float) -> pd.DataFrame:
     out = d.copy()
-    out["Loss_AED_day"] = np.clip(out["Delta_kW"], 0, None) * 24 * tariff
-    out["Loss_AED_day_s"] = out["Loss_AED_day"].rolling(6, min_periods=1).mean()
+    raw_loss = np.clip(out["Delta_kW"], 0, None) * 24 * tariff
+    out["Loss_AED_day"] = np.nan_to_num(raw_loss, nan=0.0, posinf=0.0, neginf=0.0)
+    out["Loss_AED_day_s"] = out["Loss_AED_day"].rolling(6, min_periods=1).mean().fillna(0.0)
     return out
 
 
@@ -236,26 +264,26 @@ def generate_ashrae_benchmark():
     rng = np.random.default_rng(1043)
     n = 500
     idx = pd.date_range("2026-01-01", periods=n, freq="h")
-    
+
     # Generate 50% healthy, 30% condenser fouling (CF), 20% refrigerant leak (UC)
     labels = ["SL0_Healthy"] * 250 + ["CF_Fouling"] * 150 + ["UC_Leak"] * 100
-    
+
     t_amb = rng.uniform(25, 42, n)
     load = rng.uniform(0.5, 0.9, n)
-    
+
     foul_bias = np.array([0.0 if l == "SL0_Healthy" else (2.8 if l == "CF_Fouling" else -1.2) for l in labels])
     leak_bias = np.array([0.0 if l != "UC_Leak" else 0.08 for l in labels])
-    
+
     approach = 2.0 + 0.03 * (t_amb - 25) + foul_bias + rng.normal(0, 0.1, n)
     tsc = 35.0 + 0.2 * t_amb + approach
     tse = 4.0 - 20.0 * leak_bias
-    
+
     dh_act = dh_isentropic(tsc, tse) / (ETA_IS_NOM - leak_bias)
     q_ref = h_vap(tse) - h_liq(tsc)
     m_ref = (load * RATED_TR * KW_PER_TR) / q_ref
     w_kw = m_ref * dh_act
     amps = w_kw * 1000 / (np.sqrt(3) * SUPPLY_V * POWER_FACTOR)
-    
+
     df = pd.DataFrame({
         "T_amb": t_amb,
         "T_cond_out": tsc - approach,
@@ -266,7 +294,7 @@ def generate_ashrae_benchmark():
         "Compressor_A": amps,
         "Ground_Truth_Label": labels
     }, index=idx)
-    
+
     return df
 
 
@@ -327,7 +355,7 @@ def main():
         c2.markdown(kpi("Current Specific Power (kW/TR)", f"{kwtr_now:.3f}",
                         f"Baseline {kwtr_base:.3f} · {(kwtr_now / kwtr_base - 1) * 100:+.1f}%",
                         "#e8590c" if kwtr_now / kwtr_base > 1.04 else "#2b9348"), unsafe_allow_html=True)
-        
+
         c3, c4 = st.columns(2)
         status_text = "Fouling Alert (Type A)" if last["fault_type"] == "A" else ("Leak Alert (Type B)" if last["fault_type"] == "B" else "Healthy")
         c3.markdown(kpi("Operational Status", status_text, f"Ambient {last['T_amb']:.1f} °C · Persistent Alerts: {int(d['persistent_alert'].tail(24).sum())}",
@@ -354,42 +382,42 @@ def main():
     with tabs[1]:
         st.subheader("🔬 Benchmark Validation against ASHRAE RP-1043 Experimental Protocol")
         st.write("Evaluating physics engine accuracy on 500 hourly experimental chiller conditions (Healthy vs Condenser Fouling vs Refrigerant Leak).")
-        
+
         bench_raw = generate_ashrae_benchmark()
         bench_scored = classify_faults(detect_anomalies(physics_engine(bench_raw)))
-        
+
         # Map Predictions to Ground Truth
         bench_scored["Pred_Label"] = np.select(
             [bench_scored["fault_type"] == "A", bench_scored["fault_type"] == "B"],
             ["CF_Fouling", "UC_Leak"],
             default="SL0_Healthy"
         )
-        
+
         y_true = bench_scored["Ground_Truth_Label"]
         y_pred = bench_scored["Pred_Label"]
-        
+
         col_m1, col_m2 = st.columns(2)
         with col_m1:
             st.markdown("### Classification Metrics")
             report_dict = classification_report(y_true, y_pred, output_dict=True)
             report_df = pd.DataFrame(report_dict).transpose()
             st.dataframe(report_df.style.format("{:.2f}"))
-            
+
         with col_m2:
             st.markdown("### Confusion Matrix")
             cm = confusion_matrix(y_true, y_pred, labels=["SL0_Healthy", "CF_Fouling", "UC_Leak"])
             cm_df = pd.DataFrame(cm, index=["True Healthy", "True Fouling", "True Leak"], columns=["Pred Healthy", "Pred Fouling", "Pred Leak"])
             st.dataframe(cm_df)
 
-# ----------------------------------------------------------------------- #
+    # ----------------------------------------------------------------------- #
     # TAB 3: BMS File Audit Ingestion
     # ----------------------------------------------------------------------- #
     with tabs[2]:
         st.subheader("📁 Zero-Risk BMS Log File Audit")
         st.write("Upload a raw BMS log (CSV or Excel) to run the dynamic physics audit.")
-        
+
         uploaded_file = st.file_uploader("Upload BMS Log File", type=["csv", "xlsx", "xls"])
-        
+
         if uploaded_file is not None:
             try:
                 # File loader with format fallbacks
@@ -408,37 +436,42 @@ def main():
 
                 # Normalize column names & convert units automatically
                 user_df = normalize_bms_columns(user_raw)
-                
+
                 required_cols = ["T_amb", "T_cond_out", "T_evap_out", "P_cond_kPa", "P_evap_kPa", "T_discharge", "Compressor_A"]
                 missing = [col for col in required_cols if col not in user_df.columns]
-                
+
                 if not missing:
                     st.success("File ingested and normalized successfully!")
-                    
+
                     # Run physics and financial processing
                     audited_df = add_financials(classify_faults(detect_anomalies(physics_engine(user_df))), DEWA_TARIFF)
-                    last_audit = audited_df.iloc[-1]
+
+                    # Filter active operational rows (compressor running) for running averages
+                    active_df = audited_df[audited_df["Compressor_A"] > 5.0]
+                    last_audit = active_df.iloc[-1] if len(active_df) > 0 else audited_df.iloc[-1]
+
+                    # Total cumulative waste across audited period
                     total_waste = audited_df["Loss_AED_day"].sum() / 24
-                    
+
                     st.markdown("---")
                     st.subheader("📊 Executive Audit Results")
-                    
+
                     col_a1, col_a2, col_a3 = st.columns(3)
                     col_a1.metric("Audit Period Waste", f"AED {total_waste:,.0f}")
                     col_a2.metric("Latest Daily Waste Rate", f"AED {last_audit['Loss_AED_day']:,.0f}/day")
                     col_a3.metric("Detected Fault Type", last_audit["fault_type"] if last_audit["fault_type"] else "Normal / Healthy")
-                    
+
                     # Display approach vs weather baseline chart
                     fig_audit = go.Figure()
                     fig_audit.add_trace(go.Scatter(y=audited_df["T_approach"], name="T_approach (°C)", mode="lines"))
                     fig_audit.add_trace(go.Scatter(y=audited_df["T_baseline"], name="Weather Baseline (°C)", mode="lines", line=dict(dash="dash")))
                     st.plotly_chart(style_fig(fig_audit, "BMS Audit: Approach vs Weather Baseline", "°C"), config={"displayModeBar": False})
-                    
+
                     st.download_button("Download Scored Audit (CSV)", audited_df.to_csv().encode(), "BMS_Audit_Report.csv", "text/csv")
                 else:
                     st.warning(f"File uploaded, but missing required sensor columns: {missing}")
                     st.dataframe(user_raw.head())
-                    
+
             except Exception as e:
                 st.error(f"Error processing file: {e}")
 
