@@ -109,13 +109,12 @@ def simulate_telemetry(scenario: str, season: str = "Summer (Peak Load)", seed: 
     i, hour = np.arange(n), idx.hour.values
     f0 = n - FAULT_H
 
-    # Automated seasonal profile modeling real UAE weather cycles
     if season == "Summer (Peak Load)":
-        amb_mid, amb_amp = 38.0, 6.0   # 32°C to 44°C
+        amb_mid, amb_amp = 38.0, 6.0
     elif season == "Winter (Mild Load)":
-        amb_mid, amb_amp = 22.0, 4.0   # 18°C to 26°C
-    else:  # Shoulder (Spring/Autumn)
-        amb_mid, amb_amp = 30.0, 5.0   # 25°C to 35°C
+        amb_mid, amb_amp = 22.0, 4.0
+    else:
+        amb_mid, amb_amp = 30.0, 5.0
 
     t_amb = (amb_mid + amb_amp * np.sin(2 * np.pi * (hour - 9) / 24)
              + 0.8 * np.sin(2 * np.pi * i / (24 * 6)) + rng.normal(0, 0.3, n))
@@ -123,17 +122,14 @@ def simulate_telemetry(scenario: str, season: str = "Summer (Peak Load)", seed: 
     if scenario == "Extreme Weather Spike":
         t_amb = np.minimum(t_amb + 7.0 * np.clip((i - (n - 96)) / 12, 0, 1), 50.0)
 
-    # Cooling load follows UAE ambient conditions
     load = np.clip(0.45 + 0.015 * (t_amb - 20) + rng.normal(0, 0.04, n), 0.35, 1.0)
     t_cond_in = 14.0 + 0.35 * t_amb + 4.0 + rng.normal(0, 0.25, n)
     t_cond_out = t_cond_in + 6.2 * load + rng.normal(0, 0.10, n)
     t_evap_out = 6.0 + rng.normal(0, 0.10, n)
 
-    # Fault Injections
     foul = 3.8 * np.clip((i - f0) / FAULT_H, 0, 1) if scenario == "Gradual Tube Fouling" else 0.0
     leak = (i >= f0 + 12) if scenario == "Sudden Refrigerant Leak/Pressure Loss" else np.zeros(n, bool)
 
-    # Dynamic approach baseline + injected anomalies
     approach = 2.0 + 0.03 * (t_amb - 25) + rng.normal(0, 0.12, n) + foul - 1.6 * leak
     tsc = t_cond_out + approach
     tse = t_evap_out - EVAP_APPROACH_NOM - 2.0 * leak + rng.normal(0, 0.05, n)
@@ -162,31 +158,24 @@ def physics_engine(raw: pd.DataFrame) -> pd.DataFrame:
     d = raw.copy()
     d["T_sat_cond"], d["T_sat_evap"] = t_sat(d["P_cond_kPa"]), t_sat(d["P_evap_kPa"])
 
-    # Auto-detect voltage standard if not explicitly set (460V for lab/commercial, 3300V for MV district plant)
     max_amps = d["Compressor_A"].max() if len(d) > 0 else 0
     v_supply = 460.0 if max_amps < 150 else SUPPLY_V
 
-    # Compressor electrical power input
     d["kW"] = np.sqrt(3) * v_supply * d["Compressor_A"] * POWER_FACTOR / 1000
 
-    # Refrigerant enthalpy balance
     h1, h4 = h_vap(d["T_sat_evap"]), h_liq(d["T_sat_cond"])
     h2 = h_vap(d["T_sat_cond"]) + CP_SUPERHEAT * (d["T_discharge"] - d["T_sat_cond"])
     dh_act = np.maximum(h2 - h1, 1.0)
 
-    # Protect mass flow & estimated TR when compressor is off (Amps <= 0.5)
     d["m_ref_kg_s"] = np.where(d["Compressor_A"] > 0.5, d["kW"] / dh_act, 0.0)
     d["TR_est"] = d["m_ref_kg_s"] * (h1 - h4) / KW_PER_TR
 
-    # Safe kW/TR calculation (prevents NaN / division by zero on idle)
     d["kW_per_TR"] = np.where(d["TR_est"] > 0.1, d["kW"] / d["TR_est"], 0.0)
 
-    # Condenser approach & ASHRAE Guideline 14 dynamic weather baseline
     d["T_approach"] = d["T_sat_cond"] - d["T_cond_out"]
     d["T_baseline"] = 2.0 + 0.03 * (d["T_amb"] - 25.0)
     d["T_warn"] = d["T_baseline"] + WARN_MARGIN_C
 
-    # Baseline specific power twin
     d["kWTR_baseline"] = ideal_kw_per_tr(
         d["T_cond_out"] + d["T_baseline"],
         d["T_evap_out"] - EVAP_APPROACH_NOM,
@@ -200,7 +189,6 @@ def physics_engine(raw: pd.DataFrame) -> pd.DataFrame:
         0.0
     )
 
-    # Wasted power (only computed when compressor is running under load)
     d["Delta_kW"] = np.where(
         d["TR_est"] > 0.1,
         (d["kW_per_TR"] - d["kWTR_baseline"]) * d["TR_est"],
@@ -218,7 +206,6 @@ def detect_anomalies(d: pd.DataFrame, contamination: float = 0.01) -> pd.DataFra
     model.fit(out.iloc[:train_limit][feats])
     out["raw_anomaly"] = model.predict(out[feats])
 
-    # 3-of-5 Persistence Filter
     out["anomaly_count"] = (out["raw_anomaly"] == -1).rolling(PERSIST_WINDOW, min_periods=1).sum()
     out["persistent_alert"] = out["anomaly_count"] >= PERSIST_HITS
     return out
@@ -230,9 +217,9 @@ def classify_faults(d: pd.DataFrame) -> pd.DataFrame:
     approach_s = out["T_approach"].rolling(3, min_periods=1).mean()
     kw_elevated = out["kWTR_Resid_pct"].rolling(3, min_periods=1).mean() > KW_ELEVATED_PCT
 
-    # Type A: Tube Fouling
-    rising = r.diff(24) > 0.3
-    type_a = out["persistent_alert"] & (approach_s > out["T_warn"]) & rising
+    # Type A: Tube Fouling (Catches continuous 24h drift OR steady-state step shifts > T_warn + 0.5°C)
+    rising = (r.diff(24) > 0.3) | (r.diff(3) > 0.2)
+    type_a = out["persistent_alert"] & (approach_s > out["T_warn"]) & (rising | (approach_s > out["T_warn"] + 0.5))
 
     # Type B: Refrigerant Leak
     neg = r < -0.5
@@ -265,7 +252,6 @@ def generate_ashrae_benchmark():
     n = 500
     idx = pd.date_range("2026-01-01", periods=n, freq="h")
 
-    # Generate 50% healthy, 30% condenser fouling (CF), 20% refrigerant leak (UC)
     labels = ["SL0_Healthy"] * 250 + ["CF_Fouling"] * 150 + ["UC_Leak"] * 100
 
     t_amb = rng.uniform(25, 42, n)
@@ -342,7 +328,6 @@ def main():
         d = add_financials(run_pipeline(scenario, season), tariff)
         last = d.iloc[-1]
 
-        # Metric Summaries
         app_now, base_now, warn_now = (d["T_approach"].tail(3).mean(), last["T_baseline"], last["T_warn"])
         kwtr_now, kwtr_base = d["kW_per_TR"].tail(3).mean(), d["kWTR_baseline"].tail(3).mean()
         loss_now = float(d["Loss_AED_day"].tail(6).mean())
@@ -364,7 +349,6 @@ def main():
                         f"{wasted_kw:,.0f} kW wasted power · Tariff {tariff:.2f} AED/kWh",
                         "#e8590c" if loss_now > 50 else "#2b9348"), unsafe_allow_html=True)
 
-        # Plotly Visualizations
         fig_app = go.Figure()
         fig_app.add_trace(go.Scatter(x=d.index, y=d["T_approach"], name="T_approach", mode="lines", line=dict(color="#1f77b4")))
         fig_app.add_trace(go.Scatter(x=d.index, y=d["T_baseline"], name="Weather Baseline", mode="lines", line=dict(color="#2b9348", dash="dash")))
@@ -386,7 +370,6 @@ def main():
         bench_raw = generate_ashrae_benchmark()
         bench_scored = classify_faults(detect_anomalies(physics_engine(bench_raw)))
 
-        # Map Predictions to Ground Truth
         bench_scored["Pred_Label"] = np.select(
             [bench_scored["fault_type"] == "A", bench_scored["fault_type"] == "B"],
             ["CF_Fouling", "UC_Leak"],
@@ -420,7 +403,6 @@ def main():
 
         if uploaded_file is not None:
             try:
-                # File loader with format fallbacks
                 if uploaded_file.name.lower().endswith('.csv'):
                     user_raw = pd.read_csv(uploaded_file)
                 else:
@@ -434,7 +416,6 @@ def main():
                             uploaded_file.seek(0)
                             user_raw = pd.read_csv(uploaded_file)
 
-                # Normalize column names & convert units automatically (including psig -> kPa abs fix)
                 user_df = normalize_bms_columns(user_raw)
 
                 required_cols = ["T_amb", "T_cond_out", "T_evap_out", "P_cond_kPa", "P_evap_kPa", "T_discharge", "Compressor_A"]
@@ -443,23 +424,32 @@ def main():
                 if not missing:
                     st.success("File ingested and normalized successfully!")
 
-                    # Run physics and financial processing
                     audited_df = add_financials(classify_faults(detect_anomalies(physics_engine(user_df))), DEWA_TARIFF)
 
-                    # Filter active operational rows (compressor running) for running averages
+                    # Filter active rows
                     active_df = audited_df[audited_df["Compressor_A"] > 5.0]
-                    last_audit = active_df.iloc[-1] if len(active_df) > 0 else audited_df.iloc[-1]
+                    
+                    # Audit-level Fault Summarizer across ENTIRE file
+                    type_a_count = int((active_df["fault_type"] == "A").sum())
+                    type_b_count = int((active_df["fault_type"] == "B").sum())
+                    
+                    if type_a_count > 0 and type_a_count >= type_b_count:
+                        overall_fault = f"Tube Fouling (Type A) Detected ({type_a_count} hrs)"
+                    elif type_b_count > 0:
+                        overall_fault = f"Refrigerant Leak (Type B) Detected ({type_b_count} hrs)"
+                    else:
+                        overall_fault = "Normal / Healthy Baseline"
 
-                    # Total cumulative waste across audited period
                     total_waste = audited_df["Loss_AED_day"].sum() / 24
+                    avg_daily_waste = active_df["Loss_AED_day"].mean() if len(active_df) > 0 else 0.0
 
                     st.markdown("---")
                     st.subheader("📊 Executive Audit Results")
 
                     col_a1, col_a2, col_a3 = st.columns(3)
                     col_a1.metric("Audit Period Waste", f"AED {total_waste:,.0f}")
-                    col_a2.metric("Latest Daily Waste Rate", f"AED {last_audit['Loss_AED_day']:,.0f}/day")
-                    col_a3.metric("Detected Fault Type", last_audit["fault_type"] if last_audit["fault_type"] else "Normal / Healthy")
+                    col_a2.metric("Average Daily Waste Rate", f"AED {avg_daily_waste:,.0f}/day")
+                    col_a3.metric("Primary Dataset Diagnosis", overall_fault)
 
                     # Display approach vs weather baseline chart
                     fig_audit = go.Figure()
