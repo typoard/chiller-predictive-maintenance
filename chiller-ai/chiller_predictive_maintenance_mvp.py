@@ -49,6 +49,9 @@ HOURS, TRAIN_H, FAULT_H = 21 * 24, 14 * 24, 5 * 24
 WARN_MARGIN_C, HARD_TRIP_C = 1.5, 5.5
 PERSIST_WINDOW, PERSIST_HITS = 5, 3
 DEWA_TARIFF, SEED = 0.44, 42
+# Bump whenever the pipeline changes: it is part of every cache key, because st.cache_data does NOT
+# notice edits to the functions a cached function calls (stale results survive hot-reloads/redeploys).
+APP_VERSION = "2026.11-v5"
 SMOOTH_N = 5                           # rolling-median window for raw sensor glitch removal
 MIN_LOAD_AMPS = 5.0                    # "operating under load" threshold
 
@@ -126,7 +129,8 @@ def _plant_response(t_amb, load, foul, leak, rng, rated_tr=SIM_RATED_TR, supply_
 
 
 @st.cache_data(show_spinner=False)
-def simulate_telemetry(scenario: str, amb_lo: float, amb_hi: float, seed: int = SEED) -> pd.DataFrame:
+def simulate_telemetry(scenario: str, amb_lo: float, amb_hi: float, seed: int = SEED,
+                       version: str = APP_VERSION) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
     n = HOURS
     idx = pd.date_range(end=pd.Timestamp.now().floor("h"), periods=n, freq="h")
@@ -163,7 +167,7 @@ def to_rp1043_raw(d: pd.DataFrame, power: str = "Amps", include_amb: bool = True
 
 
 @st.cache_data(show_spinner=False)
-def make_benchmark(n_per_class: int = 250, seed: int = 11) -> pd.DataFrame:
+def make_benchmark(n_per_class: int = 250, seed: int = 11, version: str = APP_VERSION) -> pd.DataFrame:
     """RP-1043-style steady-state samples in raw lab units (degF, psig) with ground-truth labels.
     Fouling severity spans 1.0-3.5 K so mild cases legitimately sit below the detection limit."""
     rng = np.random.default_rng(seed)
@@ -444,8 +448,9 @@ def add_financials(d: pd.DataFrame, tariff: float) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def run_live_pipeline(scenario: str, amb_lo: float, amb_hi: float, seed: int = SEED) -> pd.DataFrame:
-    raw = simulate_telemetry(scenario, amb_lo, amb_hi, seed)
+def run_live_pipeline(scenario: str, amb_lo: float, amb_hi: float, seed: int = SEED,
+                      version: str = APP_VERSION) -> pd.DataFrame:
+    raw = simulate_telemetry(scenario, amb_lo, amb_hi, seed, version)
     d, meta = normalize_bms_columns(raw, UNIT_MODES[2])
     d = physics_engine(d, meta["supply_v"] or SIM_SUPPLY_V)
     d = detect_anomalies(d, np.arange(len(d)) < TRAIN_H)
@@ -583,7 +588,15 @@ def meta_caption(meta):
 # --------------------------------------------------------------------------- #
 def tab_live(amb_lo, amb_hi, scenario, tariff):
     banner = st.empty()
-    d = add_financials(run_live_pipeline(scenario, float(amb_lo), float(amb_hi)), tariff)
+    d = run_live_pipeline(scenario, float(amb_lo), float(amb_hi), SEED, APP_VERSION)
+    if "Under_Load" not in d.columns:                      # stale cache from an older deployment: self-heal once
+        if not st.session_state.get("_cache_cleared"):
+            st.session_state["_cache_cleared"] = True
+            st.cache_data.clear()
+            st.rerun()
+        st.error("Cached results are from an older app version. Use menu → Clear cache, then reload.")
+        return
+    d = add_financials(d, tariff)
     last = d.iloc[-1]
     if last["T_approach"] >= HARD_TRIP_C:                                  # independent of the ML filter
         with banner.container():
@@ -658,7 +671,7 @@ def tab_benchmark(unit_mode):
     src = st.radio("Data source", ["Built-in RP-1043-style benchmark (simulated)", "Upload labelled RP-1043 / BMS file"],
                    horizontal=True)
     if src.startswith("Built-in"):
-        raw = make_benchmark()
+        raw = make_benchmark(250, 11, APP_VERSION)
         st.caption("750 steady-state samples in raw lab units (°F, psig, TCI/TCO/TEO/PRC/PRE headers); "
                    "fouling severity 1.0-3.5 °C so mild cases fall below the detection limit by design.")
         calibrate = st.checkbox("Calibrate baseline on healthy-labelled rows", value=False, key="cal_builtin")
@@ -751,7 +764,8 @@ def tab_audit(unit_mode, tariff, drive_eff):
         help="Approach rises with heat flux. When on, the reference window also fits approach vs estimated "
              "load, so load swings are not mistaken for fouling.")
     if mode.startswith("Demo"):
-        raw = to_rp1043_raw(simulate_telemetry("Gradual Tube Fouling", 30.0, 44.0), power="Amps").reset_index()
+        raw = to_rp1043_raw(simulate_telemetry("Gradual Tube Fouling", 30.0, 44.0, SEED, APP_VERSION),
+                             power="Amps").reset_index()
     else:
         up = st.file_uploader("BMS log (CSV / Excel)", type=["csv", "xlsx", "xls"], key="audit_up")
         if up is None:
