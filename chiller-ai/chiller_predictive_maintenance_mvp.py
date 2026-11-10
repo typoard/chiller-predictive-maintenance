@@ -51,9 +51,11 @@ PERSIST_WINDOW, PERSIST_HITS = 5, 3
 DEWA_TARIFF, SEED = 0.44, 42
 # Bump whenever the pipeline changes: it is part of every cache key, because st.cache_data does NOT
 # notice edits to the functions a cached function calls (stale results survive hot-reloads/redeploys).
-APP_VERSION = "2026.11-v5"
+APP_VERSION = "2026.11-v7"
 SMOOTH_N = 5                           # rolling-median window for raw sensor glitch removal
 MIN_LOAD_AMPS = 5.0                    # "operating under load" threshold
+STEADY_WINDOW_MIN = 5.0                # steady-state detector window [min] (fast-sampled logs only)
+STEADY_REL_STD = 0.04                  # max relative std of heat rejection inside that window
 
 # Fault-signature thresholds (all relative to file-specific calibrated baselines)
 A_COND_RESID_MIN = 1.0     # C above weather-adjusted baseline
@@ -352,6 +354,7 @@ def physics_engine(d: pd.DataFrame, supply_v: float = SIM_SUPPLY_V, smooth_n: in
     out["TR_est"] = np.where(ok, out["m_ref_kg_s"] * (h1 - h4) / KW_PER_TR, np.nan)
     out = out.dropna(subset=["TR_est"]).copy()
     out["kW_per_TR"] = out["kW"] / out["TR_est"]
+    out["Q_cond_kW"] = out["TR_est"] * KW_PER_TR + out["kW"] * drive_eff   # heat rejected = Q_evap + shaft work
 
     out["T_approach"] = out["T_sat_cond"] - out["T_cond_out"]             # condenser approach
     out["T_evap_approach"] = out["T_evap_out"] - out["T_sat_evap"]        # evaporator approach
@@ -365,6 +368,10 @@ def physics_engine(d: pd.DataFrame, supply_v: float = SIM_SUPPLY_V, smooth_n: in
     else:
         out["Under_Load"] = (out["kW"] > max(1.0, 0.1 * out["kW"].quantile(0.9))).to_numpy()
 
+    out["Steady"] = True                                  # refined by apply_steady_gate() for fast logs
+    out["Eligible"] = out["Under_Load"]                   # loaded (and, for fast logs, steady) rows
+    out["Evaluable"] = out["Under_Load"]                  # eligible AND inside the baseline's reference envelope
+    out["In_Envelope"] = True                             # refined by apply_baseline()
     out["T_baseline"] = 2.0 + 0.03 * (out["T_amb"] - 25.0)                # ASHRAE G14 weather curve
     out["T_warn"] = out["T_baseline"] + WARN_MARGIN_C
     out["Evap_Base"] = EVAP_APPROACH_NOM
@@ -373,47 +380,142 @@ def physics_engine(d: pd.DataFrame, supply_v: float = SIM_SUPPLY_V, smooth_n: in
     return finalize_residuals(out)
 
 
-def calibrate_baseline(d: pd.DataFrame, mask, load_adjust: bool = False) -> pd.DataFrame:
-    """File-specific healthy reference from the first N % of operating records:
-       * condenser approach : additive offset on the weather-adjusted baseline
-       * evaporator approach: its own reference level (lab instruments sit at a different offset)
-       * kW/TR              : first-principles twin re-evaluated at the calibrated approaches, then scaled"""
-    out = d.copy()
-    m = np.asarray(mask, dtype=bool) & out["Under_Load"].to_numpy()
+def _robust_lstsq(X, y):
+    """Trimmed least squares on a design matrix: fit, drop points beyond 2.5 robust sigma, refit. Keeps
+    transients and faults inside the reference data from bending the healthy baseline."""
+    keep = np.ones(len(y), dtype=bool)
+    for _ in range(3):
+        b = np.linalg.lstsq(X[keep], y[keep], rcond=None)[0]
+        r = y - X @ b
+        sig = 1.4826 * np.median(np.abs(r[keep] - np.median(r[keep]))) + 1e-9
+        new_keep = np.abs(r) <= 2.5 * sig
+        if new_keep.sum() < X.shape[1] + 8:
+            break
+        keep = new_keep
+    return np.linalg.lstsq(X[keep], y[keep], rcond=None)[0]
+
+
+def _rng(v, margin=0.10):
+    lo, hi = float(np.quantile(v, 0.02)), float(np.quantile(v, 0.98))
+    pad = margin * max(hi - lo, 1e-6)
+    return lo - pad, hi + pad
+
+
+def _design(p, q, teo, tco, quad):
+    """Operating-condition features, clipped to the range seen in the reference data (no wild extrapolation)."""
+    qs = (np.clip(q, *p["q_rng"]) - p["q_ref"]) / p["q_ref"]
+    cols = [np.ones(len(q)), qs] + ([qs ** 2] if quad else [])
+    cols += [np.clip(teo, *p["teo_rng"]) - p["teo_ref"], np.clip(tco, *p["tco_rng"]) - p["tco_ref"]]
+    return np.column_stack(cols)
+
+
+def fit_baseline(d: pd.DataFrame, mask, load_adjust: bool = True):
+    """Learn a healthy baseline from reference rows (first N % of a log, or a whole healthy file).
+       * condenser approach : weather curve + offset + slope * (heat rejection - reference)
+       * evaporator approach: linear in heat rejection, leaving-water and condenser-water temperature
+       * kW/TR              : first-principles twin x quadratic part-load / operating-condition correction
+       Without load_adjust (or with too few rows) each falls back to a constant offset / scale."""
+    m = np.asarray(mask, dtype=bool) & d["Eligible"].to_numpy()
     if m.sum() < 5:
+        return None
+    w0 = (2.0 + 0.03 * (d["T_amb"] - 25.0)).to_numpy()
+    q, teo, tco = d["Q_cond_kW"].to_numpy(), d["T_evap_out"].to_numpy(), d["T_cond_out"].to_numpy()
+    y = d["T_approach"].to_numpy() - w0
+    p = {"off": float(np.median(y[m])), "slope": 0.0, "q_ref": float(np.median(q[m])),
+         "teo_ref": float(np.median(teo[m])), "tco_ref": float(np.median(tco[m])),
+         "q_rng": _rng(q[m]), "teo_rng": _rng(teo[m]), "tco_rng": _rng(tco[m]),
+         "evap_base": float(np.median(d["T_evap_approach"].to_numpy()[m])), "evap_coef": None,
+         "kw_scale": 1.0, "kw_coef": None, "n_ref": int(m.sum())}
+    if load_adjust and m.sum() >= 30:                                     # load-aware condenser approach
+        c = np.polyfit(q[m] - p["q_ref"], y[m], 1)
+        keep = np.abs(y[m] - np.polyval(c, q[m] - p["q_ref"])) <= 2.5 * (1.4826 * np.median(
+            np.abs(y[m] - np.polyval(c, q[m] - p["q_ref"]) - np.median(y[m] - np.polyval(c, q[m] - p["q_ref"])))) + 1e-9)
+        c = np.polyfit((q[m] - p["q_ref"])[keep], y[m][keep], 1)
+        p["slope"], p["off"] = float(c[0]), float(c[1])
+    tb = w0 + p["off"] + p["slope"] * (q - p["q_ref"])
+    evap_base = np.full(len(q), p["evap_base"])
+    if load_adjust and m.sum() >= 60:                                     # condition-aware evaporator approach
+        p["evap_coef"] = _robust_lstsq(_design(p, q, teo, tco, False)[m], d["T_evap_approach"].to_numpy()[m])
+        evap_base = _design(p, q, teo, tco, False) @ p["evap_coef"]
+    twin = ideal_kw_per_tr(tco + tb, teo - evap_base, ETA_IS_NOM)
+    ratio = d["kW_per_TR"].to_numpy() / twin
+    if load_adjust and m.sum() >= 60:
+        p["kw_coef"] = _robust_lstsq(_design(p, q, teo, tco, True)[m], ratio[m])
+    else:
+        p["kw_scale"] = float(np.median(ratio[m]))
+    return p
+
+
+def apply_baseline(d: pd.DataFrame, p, enforce_envelope: bool = True) -> pd.DataFrame:
+    out = d.copy()
+    if p is None:
         return out
-    off = float(np.median((out["T_approach"] - out["T_baseline"]).to_numpy()[m]))
-    out["T_baseline"] = out["T_baseline"] + off
-    if load_adjust and m.sum() >= 30:                      # condenser approach also scales with heat flux (load)
-        tr = out["TR_est"].to_numpy()
-        slope = float(np.polyfit(tr[m], (out["T_approach"] - out["T_baseline"]).to_numpy()[m], 1)[0])
-        out["T_baseline"] = out["T_baseline"] + slope * (out["TR_est"] - float(np.median(tr[m])))
-    out["T_warn"] = out["T_baseline"] + WARN_MARGIN_C
-    ev = float(np.median(out["T_evap_approach"].to_numpy()[m]))
-    out["Evap_Base"] = ev
-    out["kWTR_baseline"] = ideal_kw_per_tr(out["T_cond_out"] + out["T_baseline"], out["T_evap_out"] - ev, ETA_IS_NOM)
-    scale = float(np.median((out["kW_per_TR"] / out["kWTR_baseline"]).to_numpy()[m]))
-    out["kWTR_baseline"] = out["kWTR_baseline"] * scale
+    q, teo, tco = out["Q_cond_kW"].to_numpy(), out["T_evap_out"].to_numpy(), out["T_cond_out"].to_numpy()
+    tb = (2.0 + 0.03 * (out["T_amb"] - 25.0)).to_numpy() + p["off"] + p["slope"] * (q - p["q_ref"])
+    evap_base = (_design(p, q, teo, tco, False) @ p["evap_coef"]) if p["evap_coef"] is not None else p["evap_base"]
+    out["T_baseline"], out["T_warn"], out["Evap_Base"] = tb, tb + WARN_MARGIN_C, evap_base
+    twin = ideal_kw_per_tr(tco + tb, teo - evap_base, ETA_IS_NOM)
+    if p["kw_coef"] is not None:
+        ratio = np.clip(_design(p, q, teo, tco, True) @ p["kw_coef"], 0.5, 3.0)
+    else:
+        ratio = p["kw_scale"]
+    out["kWTR_baseline"] = twin * ratio
+    # applicability domain: is this row inside the operating envelope the baseline was learned on?
+    out["In_Envelope"] = ((q >= p["q_rng"][0]) & (q <= p["q_rng"][1]) & (teo >= p["teo_rng"][0])
+                          & (teo <= p["teo_rng"][1]) & (tco >= p["tco_rng"][0]) & (tco <= p["tco_rng"][1]))
+    # no fault verdicts (and no waste accounting) on operating conditions the baseline has never seen
+    out["Evaluable"] = out["Eligible"] & (out["In_Envelope"] if enforce_envelope else True)
     return finalize_residuals(out)
+
+
+def calibrate_baseline(d: pd.DataFrame, mask, load_adjust: bool = False) -> pd.DataFrame:
+    return apply_baseline(d, fit_baseline(d, mask, load_adjust), enforce_envelope=False)
+
+
+def apply_steady_gate(d: pd.DataFrame, meta: dict) -> pd.DataFrame:
+    """Steady-state detector for fast-sampled logs (<= 5 min): faults are only evaluated when heat
+    rejection is stable, because approach and efficiency lag load changes. Slow (e.g. hourly) BMS
+    data cannot resolve transients, so every loaded row stays evaluable."""
+    out = d.copy()
+    out["Steady"] = True
+    hrs = ((out.index - out.index[0]).total_seconds().to_numpy(float) / 3600.0
+           if meta["time_kind"] == "datetime" else out.index.to_numpy(float))
+    dt = np.diff(hrs)
+    pos = dt[dt > 0]
+    med = float(np.median(pos)) if len(pos) else 1.0 / meta["samples_per_hour"]
+    meta["steady_gate_min"] = None
+    if med * 60.0 <= 5.0:
+        w = max(5, int(round(STEADY_WINDOW_MIN / 60.0 / med)))
+        q = out["Q_cond_kW"]
+        roll = q.rolling(w, min_periods=max(3, w // 2))
+        out["Steady"] = ((roll.std() / roll.mean()) < STEADY_REL_STD).fillna(False).to_numpy()
+        meta["steady_gate_min"] = STEADY_WINDOW_MIN
+    out["Eligible"] = out["Under_Load"] & out["Steady"]
+    out["Evaluable"] = out["Eligible"]
+    return out
 
 
 # --------------------------------------------------------------------------- #
 # ML anomaly detection + fault classification
 # --------------------------------------------------------------------------- #
-def detect_anomalies(d: pd.DataFrame, train_mask, contamination: float = 0.01) -> pd.DataFrame:
-    """Hybrid raw flags (Isolation Forest on weather/file-normalised residuals OR physics limits),
-    then the persistence filter: >= 3 anomaly flags within the last 5 time-steps."""
+def detect_anomalies(d: pd.DataFrame, train_mask, contamination: float = 0.01, train_df=None) -> pd.DataFrame:
+    """Hybrid raw flags (Isolation Forest on baseline-normalised residuals OR physics limits),
+    then the persistence filter: >= 3 anomaly flags within the last 5 time-steps.
+    train_df: healthy reference frame (already baseline-applied); default = first-N% rows of d."""
     out = d.copy()
     feats = ["Approach_Resid", "kWTR_Resid_pct", "Evap_Resid"]
-    load = out["Under_Load"].to_numpy()
-    tm = np.asarray(train_mask, dtype=bool) & load
+    ev = out["Evaluable"].to_numpy()
+    if train_df is not None:
+        train = train_df.loc[train_df["Evaluable"].to_numpy(), feats]
+    else:
+        train = out.loc[np.asarray(train_mask, dtype=bool) & ev, feats]
     rule_flag = ((out["Approach_Resid"] >= A_COND_RESID_MIN)
-                 | (out["Evap_Resid"] >= B_EVAP_RESID_MIN)).to_numpy() & load
+                 | (out["Evap_Resid"] >= B_EVAP_RESID_MIN)).to_numpy() & ev
     ml_flag = np.zeros(len(out), dtype=bool)
-    if tm.sum() >= 30:
-        model = IsolationForest(n_estimators=300, contamination=contamination, random_state=7)
-        model.fit(out.loc[tm, feats])
-        ml_flag = (model.predict(out[feats]) == -1) & load
+    if len(train) >= 30:
+        model = IsolationForest(n_estimators=300, contamination=contamination, random_state=7).fit(train)
+        ml_flag = (model.predict(out[feats]) == -1) & ev & out["In_Envelope"].to_numpy()   # no verdicts on unseen conditions
+    out["rule_flag"], out["ml_flag"] = rule_flag, ml_flag
     out["raw_anomaly"] = np.where(ml_flag | rule_flag, -1, 1)             # 1 normal, -1 anomaly
     out["anomaly_count"] = (out["raw_anomaly"] == -1).rolling(PERSIST_WINDOW, min_periods=1).sum()
     out["persistent_alert"] = out["anomaly_count"] >= PERSIST_HITS
@@ -425,7 +527,7 @@ def classify_faults(d: pd.DataFrame, smooth: int = 3, gate: bool = True) -> pd.D
     out = d.copy()
     sm = (lambda s: s.rolling(smooth, min_periods=1).mean()) if smooth > 1 else (lambda s: s)
     cond_r, evap_r, kw_r = sm(out["Approach_Resid"]), sm(out["Evap_Resid"]), sm(out["kWTR_Resid_pct"])
-    load = out["Under_Load"]
+    load = out["Evaluable"]
 
     # TYPE B: low-side elevation over its own baseline + condenser approach drop + power spike
     type_b = (evap_r >= B_EVAP_RESID_MIN) & (cond_r <= B_COND_RESID_MAX) & (kw_r > B_KW_MIN_PCT) & load
@@ -440,10 +542,12 @@ def classify_faults(d: pd.DataFrame, smooth: int = 3, gate: bool = True) -> pd.D
 
 
 def add_financials(d: pd.DataFrame, tariff: float) -> pd.DataFrame:
+    """Waste_kW is SIGNED excess power over the healthy baseline on evaluable rows. Clipping each noisy sample
+    at zero would manufacture waste on a healthy chiller, so only totals / smoothed series are floored at 0."""
     out = d.copy()
-    out["Waste_kW"] = np.where(out["Under_Load"], np.clip(out["Delta_kW"], 0, None), 0.0)
+    out["Waste_kW"] = np.where(out["Evaluable"], out["Delta_kW"], 0.0)
     out["Loss_AED_day"] = out["Waste_kW"] * 24 * tariff                    # Delta_kW * 24 h * tariff
-    out["Loss_AED_day_s"] = out["Loss_AED_day"].rolling(6, min_periods=1).mean()
+    out["Loss_AED_day_s"] = out["Loss_AED_day"].rolling(6, min_periods=1).mean().clip(lower=0)
     return out
 
 
@@ -473,7 +577,7 @@ def operational_status(d: pd.DataFrame):
 
 def build_insight(d: pd.DataFrame):
     last, tail = d.iloc[-1], d.tail(3)
-    loss = float(d["Loss_AED_day"].tail(6).mean())
+    loss = max(0.0, float(d["Loss_AED_day"].tail(6).mean()))
     cr, er, kr = tail["Approach_Resid"].mean(), tail["Evap_Resid"].mean(), tail["kWTR_Resid_pct"].mean()
     if last["fault_type"] == "A":
         m = min(len(d), 48)
@@ -580,6 +684,8 @@ def meta_caption(meta):
     notes.append({"datetime": "time axis: timestamps", "elapsed": "time axis: relative seconds → hours",
                   "rows": f"time axis: row counter @ {meta['samples_per_hour']:g}/h",
                   "none": f"no time column: {meta['samples_per_hour']:g} samples/h assumed"}[tk])
+    if meta.get("steady_gate_min"):
+        notes.append(f"steady-state gate: {meta['steady_gate_min']:g}-min window")
     st.caption("Normalisation → " + " · ".join(notes))
 
 
@@ -606,8 +712,8 @@ def tab_live(amb_lo, amb_hi, scenario, tariff):
     status, scolor = operational_status(d)
     app_now, base_now, warn_now = d["T_approach"].tail(3).mean(), last["T_baseline"], last["T_warn"]
     kwtr_now, kwtr_base = d["kW_per_TR"].tail(3).mean(), d["kWTR_baseline"].tail(3).mean()
-    loss_now = float(d["Loss_AED_day"].tail(6).mean())
-    wasted_kw = float(d["Waste_kW"].tail(6).mean())
+    loss_now = max(0.0, float(d["Loss_AED_day"].tail(6).mean()))
+    wasted_kw = max(0.0, float(d["Waste_kW"].tail(6).mean()))
 
     c1, c2 = st.columns(2)
     c1.markdown(kpi("T_approach vs baseline", f"{app_now:.1f} °C",
@@ -709,24 +815,63 @@ def tab_benchmark(unit_mode):
 # --------------------------------------------------------------------------- #
 # Tab 3 - BMS file audit
 # --------------------------------------------------------------------------- #
-def analyze_log(raw, unit_mode, calib_pct, samples_per_hour=60.0, drive_eff=1.0, load_adjust=False):
+def prepare_log(raw, unit_mode, samples_per_hour, drive_eff):
+    """normalise -> clean -> physics -> steady-state gate. Returns (frame, meta, error)."""
     d, meta = normalize_bms_columns(raw, unit_mode, samples_per_hour)
     miss = missing_required(d)
     if miss:
         return None, meta, f"Missing required columns after normalisation: {', '.join(miss)}"
-    need = ["T_cond_out", "T_evap_out", "P_cond_kPa", "P_evap_kPa"]
-    d = d.dropna(subset=need)
+    d = d.dropna(subset=["T_cond_out", "T_evap_out", "P_cond_kPa", "P_evap_kPa"])
     d = physics_engine(d, meta["supply_v"] or SIM_SUPPLY_V, smooth_n=SMOOTH_N, drive_eff=drive_eff)
     if len(d) < 10:
         return None, meta, "Fewer than 10 valid rows after cleaning."
-    k = max(int(len(d) * calib_pct / 100), min(10, len(d)))               # reference window: first N %, min 10 rows
-    train_mask = np.arange(len(d)) < k
-    if k >= 10:
-        d = calibrate_baseline(d, train_mask, load_adjust)
-    d = detect_anomalies(d, train_mask)
-    d = classify_faults(d, smooth=3, gate=True)
-    meta["ml_used"], meta["train_n"] = bool((train_mask & d["Under_Load"].to_numpy()).sum() >= 30), k
-    return d, meta, None
+    return apply_steady_gate(d, meta), meta, None
+
+
+def _block_means(d, rows=30):
+    r = d.loc[d["Evaluable"], "Approach_Resid"].to_numpy()
+    nb = len(r) // rows
+    return r[:nb * rows].reshape(nb, rows).mean(axis=1) if nb >= 3 else np.array([])
+
+
+def drift_vs_reference(d, dr):
+    """Sustained shift of the condenser-approach residual vs a healthy reference file, using block means
+    so that a small but persistent offset (e.g. mild tube fouling) is separable from sample noise.
+    Returns (shift [C], z-score) or None."""
+    a, b = _block_means(d), _block_means(dr)
+    if len(a) < 5 or len(b) < 5:
+        return None
+    shift = float(a.mean() - b.mean())
+    se = float(np.sqrt(a.var(ddof=1) / len(a) + b.var(ddof=1) / len(b))) + 1e-9
+    return shift, shift / se
+
+
+def analyze_log(raw, unit_mode, calib_pct, samples_per_hour=60.0, drive_eff=1.0, load_adjust=True, ref_raw=None):
+    """Baseline source: the first N % of the log (default) or a separate known-healthy reference file."""
+    d, meta, err = prepare_log(raw, unit_mode, samples_per_hour, drive_eff)
+    if err:
+        return None, meta, err
+    n = len(d)
+    k = max(int(n * calib_pct / 100), min(10, n))                         # reference window: first N %, min 10 rows
+    train_mask = np.arange(n) < k
+    meta["ref_external"], meta["drift"] = False, None
+    if ref_raw is not None:
+        dr, _, er = prepare_log(ref_raw, unit_mode, samples_per_hour, drive_eff)
+        if er:
+            return None, meta, f"Healthy reference file: {er}"
+        params = fit_baseline(dr, np.ones(len(dr), dtype=bool), load_adjust)
+        if params is None:
+            return None, meta, "Healthy reference file has too few loaded, steady records."
+        dr, d = apply_baseline(dr, params), apply_baseline(d, params)
+        d = detect_anomalies(d, train_mask, train_df=dr)
+        meta.update(ref_external=True, drift=drift_vs_reference(d, dr), train_n=0,
+                    ml_used=bool(dr["Evaluable"].sum() >= 30))
+    else:
+        d = apply_baseline(d, fit_baseline(d, train_mask, load_adjust))
+        d = detect_anomalies(d, train_mask)
+        meta["ml_used"] = bool((train_mask & d["Evaluable"].to_numpy()).sum() >= 30)
+        meta["train_n"] = k
+    return classify_faults(d, smooth=3, gate=True), meta, None
 
 
 def time_span(d, meta):
@@ -755,22 +900,31 @@ def tab_audit(unit_mode, tariff, drive_eff):
                     horizontal=True)
     c1, c2 = st.columns(2)
     calib_pct = c1.slider("Healthy reference window at start of log (%)", 5, 40, 15,
-                          help="First N % of operating records: calibrates the condenser/evaporator approach "
-                               "baselines and kW/TR, and trains the anomaly model. Assumed healthy.")
+                          help="First N % of operating records: calibrates the baselines and trains the anomaly "
+                               "model. Assumed healthy. Ignored when a healthy reference file is supplied.")
     sph = c2.number_input("Samples per hour", 1, 7200, 60,
                           help="Only used when the log has no real time axis (no Time column or a row counter).")
     load_adjust = st.checkbox(
-        "Load-adjust the condenser-approach baseline (recommended for lab / variable-load data)", value=False,
-        help="Approach rises with heat flux. When on, the reference window also fits approach vs estimated "
-             "load, so load swings are not mistaken for fouling.")
+        "Load-aware baselines (recommended)", value=True,
+        help="Condenser approach and kW/TR depend on heat flux / load. When on, the reference data also fits "
+             "them against estimated heat rejection, so normal load swings are not mistaken for faults.")
+    ref_raw = None
+    with st.expander("Optional: healthy reference file (use when the log may be faulted from its first row)"):
+        ref_up = st.file_uploader("Known-healthy log of the same machine (CSV / Excel)", type=["csv", "xlsx", "xls"],
+                                  key="ref_up")
+        if ref_up is not None:
+            try:
+                ref_raw = read_table(ref_up, pick_sheet(ref_up, "ref_sheet"))
+            except Exception as e:
+                st.error(f"Could not read reference file: {e}")
     if mode.startswith("Demo"):
         raw = to_rp1043_raw(simulate_telemetry("Gradual Tube Fouling", 30.0, 44.0, SEED, APP_VERSION),
                              power="Amps").reset_index()
     else:
         up = st.file_uploader("BMS log (CSV / Excel)", type=["csv", "xlsx", "xls"], key="audit_up")
         if up is None:
-            st.info("Upload a BMS export or an ASHRAE RP-1043 file (e.g. cf12.xls) with condenser/evaporator "
-                    "temperatures & pressures and compressor kW or current.")
+            st.info("Upload a BMS export or an ASHRAE RP-1043 file (e.g. cf12.xls / normal.xls) with condenser/"
+                    "evaporator temperatures & pressures and compressor kW or current.")
             return
         try:
             raw = read_table(up, pick_sheet(up, "audit_sheet"))
@@ -778,34 +932,50 @@ def tab_audit(unit_mode, tariff, drive_eff):
             st.error(f"Could not read file (legacy .xls needs `pip install xlrd`, .xlsx needs `openpyxl`): {e}")
             return
 
-    d, meta, err = analyze_log(raw, unit_mode, calib_pct, float(sph), drive_eff, load_adjust)
+    d, meta, err = analyze_log(raw, unit_mode, calib_pct, float(sph), drive_eff, load_adjust, ref_raw)
     if err:
         st.error(err)
         return
     meta_caption(meta)
+    if meta["ref_external"]:
+        st.caption("Baselines learned from the healthy reference file (reference window slider not used).")
     if not meta["ml_used"]:
-        st.caption("Reference window has <30 loaded rows: Isolation Forest skipped, physics-limit flags only.")
+        st.caption("Reference data has <30 evaluable rows: Isolation Forest skipped, physics-limit flags only.")
     d = add_financials(d, tariff)
+    cover = float(d["Evaluable"].sum()) / max(float(d["Under_Load"].sum()), 1.0)
+    if cover < 0.5:
+        st.warning(f"Only {cover * 100:.0f}% of loaded records fall inside the operating envelope (load, water "
+                   "temperatures) covered by the reference data, so the rest get no fault verdict. Widen the "
+                   "reference window or upload a healthy reference file for fuller coverage.")
 
     # ---- time span & financials (relative seconds are NOT epoch timestamps)
     dt_h, total_hours = time_span(d, meta)
     total_days = max(total_hours / 24.0, 0.01)
-    waste_kwh = float((d["Waste_kW"].to_numpy() * dt_h).sum())
+    under, ev = d["Under_Load"].to_numpy(), d["Evaluable"].to_numpy()
+    ev_h, under_h = float((dt_h * ev).sum()), float((dt_h * under).sum())
+    mean_waste_kw = float((d["Waste_kW"].to_numpy() * dt_h).sum() / ev_h) if ev_h > 0 else 0.0
+    waste_kwh = max(mean_waste_kw * under_h, 0.0)                         # net excess energy, floored at 0
     total_aed = waste_kwh * tariff
     per_day = total_aed / total_days                                       # AED/day
 
-    counts = d["fault_type"].value_counts()
-    share = {t: counts.get(t, 0) / len(d) for t in ["A", "B"]}
-    n_loaded = int(d["Under_Load"].sum())
-    if counts.get("A", 0) + counts.get("B", 0) < max(3, 0.01 * len(d)):
-        diagnosis, dcolor = "No dominant fault - operating healthy", "#2b9348"
+    n_ev = max(int(ev.sum()), 1)
+    counts = d.loc[d["Evaluable"], "fault_type"].value_counts()
+    share = {t: counts.get(t, 0) / n_ev for t in ["A", "B"]}
+    drift = meta["drift"]
+    if counts.get("A", 0) + counts.get("B", 0) < max(3, 0.01 * n_ev):
+        if drift and drift[0] >= 0.15 and drift[1] >= 5:
+            diagnosis = (f"Sub-threshold condenser drift: +{drift[0]:.2f} °C vs healthy reference "
+                         f"(z = {drift[1]:.0f}) - consistent with early / mild fouling")
+            dcolor = "#f08c00"
+        else:
+            diagnosis, dcolor = "No dominant fault - operating healthy", "#2b9348"
     else:
         main = "A" if counts.get("A", 0) >= counts.get("B", 0) else "B"
         active = " · active at end of log" if (d["fault_type"].tail(24) == main).any() else ""
-        diagnosis = f"{DIAG_NAME[main]} - {share[main] * 100:.0f}% of records{active}"
+        diagnosis = f"{DIAG_NAME[main]} - {share[main] * 100:.0f}% of evaluable records{active}"
         dcolor = "#e8590c" if main == "A" else "#c2255c"
 
-    trips = int(((d["T_approach"] >= HARD_TRIP_C) & d["Under_Load"]).sum())
+    trips = int(((d["T_approach"] >= HARD_TRIP_C) & d["Evaluable"]).sum())
     if trips:
         st.error(f"⚠️ CRITICAL HARD THRESHOLD BREACH: {trips} record(s) with T_approach ≥ {HARD_TRIP_C} °C. "
                  "Immediate Physical Inspection Required.")
@@ -813,12 +983,13 @@ def tab_audit(unit_mode, tariff, drive_eff):
     span_txt = f"{total_hours:.1f} h ({total_days:.2f} days)" if total_hours < 48 else f"{total_days:.1f} days"
     k1, k2 = st.columns(2)
     k1.markdown(kpi("Total period waste", f"AED {total_aed:,.0f}", f"{waste_kwh:,.1f} kWh over {span_txt} · {tariff:.2f} AED/kWh",
-                    "#e8590c"), unsafe_allow_html=True)
-    k2.markdown(kpi("Average daily waste", f"AED {per_day:,.0f}/day", f"{len(d):,} records · {n_loaded:,} under load",
-                    "#e8590c"), unsafe_allow_html=True)
+                    "#e8590c" if total_aed > 0 else "#2b9348"), unsafe_allow_html=True)
+    k2.markdown(kpi("Average daily waste", f"AED {per_day:,.0f}/day",
+                    f"{len(d):,} records · {int(under.sum()):,} under load · {n_ev / max(int(under.sum()), 1) * 100:.0f}% evaluable",
+                    "#e8590c" if per_day > 0 else "#2b9348"), unsafe_allow_html=True)
     st.markdown(kpi("Primary dataset diagnosis", diagnosis,
-                    f"Type A {share['A'] * 100:.0f}% · Type B {share['B'] * 100:.0f}% · healthy/unclassified "
-                    f"{(1 - share['A'] - share['B']) * 100:.0f}%", dcolor), unsafe_allow_html=True)
+                    f"Type A {share['A'] * 100:.1f}% · Type B {share['B'] * 100:.1f}% · healthy/unclassified "
+                    f"{(1 - share['A'] - share['B']) * 100:.1f}% (of evaluable records)", dcolor), unsafe_allow_html=True)
     if total_hours < 24:
         st.caption(f"Log spans only {total_hours:.1f} h: the AED/day figure extrapolates this period to 24 h.")
 
@@ -835,7 +1006,8 @@ def tab_audit(unit_mode, tariff, drive_eff):
     st.plotly_chart(chart_approach(d, meta["train_n"] if meta["train_n"] >= 10 else None,
                                    relative=meta["time_kind"] != "datetime"), config={"displayModeBar": False})
     cols = ["T_amb", "T_approach", "T_baseline", "T_warn", "T_evap_approach", "Evap_Base", "kW", "TR_est",
-            "kW_per_TR", "kWTR_baseline", "Delta_kW", "Loss_AED_day", "Under_Load", "persistent_alert", "fault_label"]
+            "Q_cond_kW", "kW_per_TR", "kWTR_baseline", "Delta_kW", "Loss_AED_day", "Under_Load", "Evaluable",
+            "persistent_alert", "fault_label"]
     out_csv = d[cols].round(4)
     out_csv.index.name = "elapsed_hours" if meta["time_kind"] != "datetime" else "timestamp"
     st.download_button("Download scored dataset (CSV)", out_csv.to_csv().encode(),
