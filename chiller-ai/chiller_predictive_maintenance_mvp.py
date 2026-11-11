@@ -64,6 +64,7 @@ DISPLAY_NAME = {
     UC: "Refrigerant Leak / Undercharge (Type B)",
     MIXED: "Mixed Fault (Type A + B signatures)",
     "INSUFFICIENT": "Insufficient steady-state data",
+    "INDETERMINATE": "Indeterminate (too little data inside the healthy-reference envelope)",
 }
 
 PSI_TO_KPA = 6.89476
@@ -111,9 +112,14 @@ class Config:
     tariff: float = 0.44  # AED / kWh (DEWA default)
     eta: float = 0.69  # effective compressor+motor efficiency for enthalpy tonnage
     median_win: int = 5  # rolling-median samples (transient noise filter)
-    thr_cond: float = 1.5  # degC  condenser approach residual trigger
-    thr_evap: float = 1.5  # degC  evaporator approach residual trigger
-    thr_kwtr_pct: float = 10.0  # %     specific-power residual trigger (Type B)
+    thr_mode: str = "auto"  # "auto" (k-sigma of healthy noise) | "spec" | "custom"
+    thr_cond: float = 1.5  # degC  condenser approach residual trigger (spec/custom modes)
+    thr_evap: float = 1.5  # degC  evaporator approach residual trigger (spec/custom modes)
+    thr_kwtr_pct: float = 10.0  # %     specific-power residual trigger (spec/custom modes)
+    auto_k: float = 3.0  # sigma multiple used in auto mode
+    auto_floor: float = 0.25  # K, minimum trigger in auto mode
+    persist_s: float = 1800.0  # s, persistence window (median of residuals) before classification
+    ref_mode: str = "auto"  # "auto" | "builtin" | "window"
     ref_pct: float = 12.0  # %     healthy reference window (first N % of records)
     capacity_source: str = "enthalpy"  # "enthalpy" | "measured"
     steady_gate: str = "auto"  # "auto" | "on" | "off"
@@ -321,6 +327,12 @@ def physics_engine(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     else:
         t_suc = d["tsat_evap"] + 5.0
     t_suc = np.maximum(t_suc, d["tsat_evap"])
+    if ("t_suc" in d and d["t_suc"].notna().any()):
+        d["superheat_k"] = t_suc - d["tsat_evap"]
+    elif "superheat_k" not in d:
+        d["superheat_k"] = np.nan
+    if "subcool_k" not in d:
+        d["subcool_k"] = np.nan
     h_suc = hg_r134a(d["tsat_evap"]) + CP_VAP_SUCTION * (t_suc - d["tsat_evap"])
 
     # liquid state leaving condenser
@@ -383,11 +395,35 @@ def physics_engine(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 # 3. Reference model & fault classifier
 # ----------------------------------------------------------------------------
 FEATS = ["t_evap_out", "t_cw", "tr"]
-TARGETS = ["cond_approach", "evap_approach", "kw_per_tr"]
+CORE_TARGETS = ["cond_approach", "evap_approach", "kw_per_tr"]
+EXTRA_TARGETS = ["tsat_cond", "subcool_k", "superheat_k"]
+SMOOTH_COLS = ["cond_approach", "evap_approach", "kw_per_tr", "t_evap_out", "t_cw", "tr", "kw", "tsat_cond", "subcool_k", "superheat_k"]
+SIG_FEATS = ["dC", "dE", "kwtr_resid_pct", "dTc", "dSub", "dSh"]
+RESID_SPEC = {  # residual column -> (target, relative?)
+    "dC": ("cond_approach", False), "dE": ("evap_approach", False), "kwtr_resid_pct": ("kw_per_tr", True),
+    "dTc": ("tsat_cond", False), "dSub": ("subcool_k", False), "dSh": ("superheat_k", False),
+}
+
+
+def _mad_sd(x: np.ndarray) -> float:
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if len(x) < 5:
+        return np.nan
+    return float(1.4826 * np.median(np.abs(x - np.median(x))))
+
+
+def _persist(series: pd.Series, eligible: pd.Series, w: int) -> pd.Series:
+    """Rolling median over eligible rows only (others are NaN and ignored)."""
+    x = series.where(eligible)
+    if w <= 1:
+        return x
+    return x.rolling(w, center=True, min_periods=max(1, w // 4)).median().where(eligible)
 
 
 class ReferenceModel:
-    """Healthy-state regression: approaches and kW/TR as f(T_evap_out, T_cond_in, tonnage)."""
+    """Healthy-state regression: approaches, kW/TR (and saturation temp, sub-cooling, superheat when
+    available) as f(T_evap_out, T_cond_in, tonnage).  Stores healthy-noise levels for sigma thresholds."""
 
     TOL = {"t_evap_out": 1.5, "t_cw": 2.5}
 
@@ -400,6 +436,8 @@ class ReferenceModel:
         self.hi = None
         self.n_fit = 0
         self.source = ""
+        self.noise: Dict[str, float] = {}
+        self.kwtr_mean = 1.0
 
     @staticmethod
     def _basis(Z: np.ndarray, kind: str) -> np.ndarray:
@@ -411,54 +449,81 @@ class ReferenceModel:
             return np.column_stack([np.ones(n), te, tc, ld])
         return np.ones((n, 1))
 
-    def fit(self, d: pd.DataFrame, source: str = "") -> "ReferenceModel":
-        X = d[FEATS].to_numpy(float)
-        ok = np.isfinite(X).all(axis=1) & d[TARGETS].notna().all(axis=1).to_numpy()
-        X = X[ok]
+    def fit(self, d: pd.DataFrame, source: str = "", persist_rows: int = 1, noise_inflate: float = 1.25) -> "ReferenceModel":
+        X_all = d[FEATS].to_numpy(float)
+        ok = np.isfinite(X_all).all(axis=1) & d[CORE_TARGETS].notna().all(axis=1).to_numpy()
+        d = d.loc[ok]
+        X = X_all[ok]
         n = len(X)
         if n < 8:
             raise ValueError(f"Only {n} usable healthy-reference rows; widen the reference window or provide a healthy log.")
-        self.n_fit = n
-        self.source = source
+        self.n_fit, self.source = n, source
         self.mu = X.mean(axis=0)
-        sd = X.std(axis=0)
         floors = np.array([1.0, 1.0, max(0.02 * abs(self.mu[2]), 1.0)])
-        self.sd = np.maximum(sd, floors)
+        self.sd = np.maximum(X.std(axis=0), floors)
         span_load = np.ptp(X[:, 2])
-        if n >= 150 and span_load >= 0.2 * max(self.mu[2], 1.0):
-            self.kind = "quad"
-        elif n >= 30:
-            self.kind = "lin"
-        else:
-            self.kind = "const"
+        self.kind = "quad" if (n >= 150 and span_load >= 0.2 * max(self.mu[2], 1.0)) else ("lin" if n >= 30 else "const")
         Z = (X - self.mu) / self.sd
         B = self._basis(Z, self.kind)
-        lam = 1e-4 * n
-        reg = np.sqrt(lam) * np.eye(B.shape[1])
+        reg = np.sqrt(1e-4 * n) * np.eye(B.shape[1])
         reg[0, 0] = 0.0
-        A = np.vstack([B, reg])
-        for t in TARGETS:
-            y = d.loc[ok, t].to_numpy(float)
-            yy = np.concatenate([y, np.zeros(B.shape[1])])
+        targets = CORE_TARGETS + [t for t in EXTRA_TARGETS if t in d and d[t].notna().mean() > 0.9]
+        self.coef, self.noise = {}, {}
+        w = max(1, int(persist_rows))
+        for t in targets:
+            m = d[t].notna().to_numpy()
+            Bm = B[m]
+            A = np.vstack([Bm, reg])
+            yy = np.concatenate([d[t].to_numpy(float)[m], np.zeros(B.shape[1])])
             self.coef[t] = np.linalg.lstsq(A, yy, rcond=None)[0]
+            res = pd.Series(d[t].to_numpy(float)[m] - Bm @ self.coef[t])
+            res = res.rolling(w, center=True, min_periods=max(1, w // 4)).median() if w > 1 else res
+            self.noise[t] = _mad_sd(res.to_numpy()) * noise_inflate
+        self.kwtr_mean = float(np.nanmedian(d["kw_per_tr"]))
+        self.noise["kwtr_pct"] = 100.0 * self.noise["kw_per_tr"] / max(self.kwtr_mean, 1e-6)
         span = np.ptp(X, axis=0)
         tol = np.array([self.TOL["t_evap_out"], self.TOL["t_cw"], 0.15 * max(abs(self.mu[2]), 1.0)])
         margin = np.maximum(0.10 * span, tol)
-        self.lo = X.min(axis=0) - margin
-        self.hi = X.max(axis=0) + margin
+        self.lo, self.hi = X.min(axis=0) - margin, X.max(axis=0) + margin
         return self
 
     def predict(self, d: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
         X = d[FEATS].to_numpy(float)
         in_dom = pd.Series(np.isfinite(X).all(axis=1) & (X >= self.lo).all(axis=1) & (X <= self.hi).all(axis=1), index=d.index)
-        Xc = np.clip(X, self.lo, self.hi)
-        Z = (Xc - self.mu) / self.sd
+        Z = (np.clip(X, self.lo, self.hi) - self.mu) / self.sd
         B = self._basis(np.nan_to_num(Z), self.kind)
-        out = pd.DataFrame({t: B @ self.coef[t] for t in TARGETS}, index=d.index)
-        return out, in_dom
+        return pd.DataFrame({t: B @ c for t, c in self.coef.items()}, index=d.index), in_dom
 
     def describe(self) -> str:
         return f"{self.kind} regression on {self.n_fit} healthy rows ({self.source})"
+
+    def to_dict(self) -> dict:
+        return {"kind": self.kind, "mu": list(map(float, self.mu)), "sd": list(map(float, self.sd)),
+                "lo": list(map(float, self.lo)), "hi": list(map(float, self.hi)), "n_fit": self.n_fit,
+                "coef": {k: list(map(float, v)) for k, v in self.coef.items()},
+                "noise": {k: float(v) for k, v in self.noise.items()}, "kwtr_mean": self.kwtr_mean, "source": self.source}
+
+    @classmethod
+    def from_dict(cls, dct: dict) -> "ReferenceModel":
+        m = cls()
+        m.kind, m.n_fit, m.source = dct["kind"], dct["n_fit"], dct["source"]
+        m.mu, m.sd, m.lo, m.hi = (np.array(dct[k], dtype=float) for k in ["mu", "sd", "lo", "hi"])
+        m.coef = {k: np.array(v, dtype=float) for k, v in dct["coef"].items()}
+        m.noise, m.kwtr_mean = dict(dct["noise"]), dct["kwtr_mean"]
+        return m
+
+
+# Built-in healthy (SL0) reference fitted on the ASHRAE RP-1043 lab chiller `normal.xls`
+# (90-ton centrifugal, R-134a).  Valid for that machine's operating envelope; site chillers fall
+# back to the first-N % window automatically.  Noise levels come from held-out 30-min blocks.
+BUILTIN_SL0_JSON = '{"kind":"quad","mu":[7.226429652042372,23.579793242562364,58.205261882393785],"sd":[2.2642370675345527,4.308464300341488,23.224827875533],"lo":[2.416666666666665,14.3,17.389961218665853],"hi":[11.944444444444443,32.23888888888889,106.22744596818578],"n_fit":3305,"coef":{"cond_approach":[1.8812692530384394,0.09738477806668877,-0.23327919566926475,0.7363775591887352,0.025606658333492908,0.09418171493955334,-0.15257902944602278],"evap_approach":[3.0996367440686727,1.05832429062093,-0.28962421110033176,0.5087768375124787,-0.06598959664657739,0.06483927686336692,-0.09795336041051018],"kw_per_tr":[0.9030958564447835,-0.016570488968940277,0.10022941227039131,-0.1770174213878012,0.08339993828276421,-0.01263065303479395,-0.0006579182205153771],"tsat_cond":[28.903922441562504,0.08804278387740683,4.059317007594411,2.1262048215391887,0.03309674594275703,0.09200080979614529,-0.16984429874362858],"subcool_k":[3.511617482009146,0.04892434967805234,-0.02787619427690428,1.106035349460721,-0.004010070720693403,0.07123481247697715,-0.15695493311155745],"superheat_k":[2.1062013487899027,0.8368170086467374,-0.22874475810086325,-0.10475814406014122,-0.025159380491089324,-0.007263598597237766,-0.06782565255433322]},"noise":{"cond_approach":0.10493136286176583,"evap_approach":0.1738384382647301,"kw_per_tr":0.01968562654925404,"tsat_cond":0.10228845111662563,"subcool_k":0.23985068749613175,"superheat_k":0.0872921367081879,"kwtr_pct":2.1089034602152923},"kwtr_mean":0.9334531864841449,"source":"ASHRAE RP-1043 normal.xls (SL0), 90-ton lab chiller"}'
+
+
+def builtin_reference() -> Optional[ReferenceModel]:
+    import json
+    if BUILTIN_SL0_JSON.startswith("__BUILTIN"):
+        return None
+    return ReferenceModel.from_dict(json.loads(BUILTIN_SL0_JSON))
 
 
 def _steady_mask(d: pd.DataFrame, cfg: Config) -> pd.Series:
@@ -480,11 +545,16 @@ def _steady_mask(d: pd.DataFrame, cfg: Config) -> pd.Series:
 def prepare_features(d: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     """Apply the rolling-median noise filter and steady-state gate."""
     d = d.copy()
-    for c in ["cond_approach", "evap_approach", "kw_per_tr", "t_evap_out", "t_cw", "tr", "kw"]:
-        d[c + "_raw"] = d[c]
-        d[c] = _rolling_median(d[c], cfg.median_win)
+    for c in SMOOTH_COLS:
+        if c in d:
+            d[c + "_raw"] = d[c]
+            d[c] = _rolling_median(d[c], cfg.median_win)
     d["steady"] = _steady_mask(d, cfg)
     return d
+
+
+def _persist_rows(d: pd.DataFrame, cfg: Config) -> int:
+    return max(1, int(round(cfg.persist_s / _median_dt_s(d["t_s"].values))))
 
 
 def fit_reference_from_window(d: pd.DataFrame, cfg: Config) -> ReferenceModel:
@@ -498,49 +568,102 @@ def fit_reference_from_window(d: pd.DataFrame, cfg: Config) -> ReferenceModel:
         src = f"first {cfg.ref_pct:.0f}% of records, running rows (too few steady rows)"
     if len(cand) < 8:
         raise ValueError("The healthy reference window contains almost no running data. Increase the window % or supply a healthy log.")
-    return ReferenceModel().fit(cand, src)
+    return ReferenceModel().fit(cand, src, _persist_rows(d, cfg), noise_inflate=2.0)
 
 
-def fit_reference_from_log(d: pd.DataFrame, mask: Optional[pd.Series] = None, source: str = "healthy reference log") -> ReferenceModel:
+def fit_reference_from_log(d: pd.DataFrame, mask: Optional[pd.Series] = None, source: str = "healthy reference log",
+                           persist_rows: int = 1) -> ReferenceModel:
     cand = d[d["steady"]] if mask is None else d[d["steady"] & mask]
     if len(cand) < 20:
         cand = d[d["running"]] if mask is None else d[d["running"] & mask]
-    return ReferenceModel().fit(cand, source)
+    return ReferenceModel().fit(cand, source, persist_rows)
 
 
-def classify_faults(d: pd.DataFrame, cfg: Config, ref: ReferenceModel, eval_mask: Optional[pd.Series] = None) -> pd.DataFrame:
-    """Dual-loop, reference-calibrated thermodynamic classifier (no ML).
+def domain_coverage(d: pd.DataFrame, ref: ReferenceModel) -> float:
+    base = d["steady"] if d["steady"].sum() >= 20 else d["running"]
+    if base.sum() == 0:
+        return 0.0
+    _, in_dom = ref.predict(d)
+    return float((in_dom & base).sum() / base.sum())
 
-    Residuals are measured against the healthy reference for the *same* operating point:
-      dC = condenser-approach residual  (degC)
-      dE = evaporator-approach residual (degC)
-      pk = specific-power residual      (%)
-    Type A: dC >= thr_cond  AND dE <  thr_evap
-    Type B: dE >= thr_evap  AND pk >  thr_kwtr_pct AND dC < thr_cond
-    Both loops high -> Mixed.  Everything else classified (steady, in-domain) -> SL0.
+
+def select_reference(feat: pd.DataFrame, cfg: Config) -> ReferenceModel:
+    if cfg.ref_mode in ("auto", "builtin"):
+        b = builtin_reference()
+        if b is not None:
+            cov = domain_coverage(feat, b)
+            if cfg.ref_mode == "builtin" or cov >= 0.6:
+                b.source = f"{b.source}; covers {100 * cov:.0f}% of this file's steady rows"
+                return b
+    return fit_reference_from_window(feat, cfg)
+
+
+def resolve_thresholds(cfg: Config, ref: ReferenceModel) -> dict:
+    if cfg.thr_mode == "auto":
+        k, fl = cfg.auto_k, cfg.auto_floor
+        nz = ref.noise
+        g = lambda key, default: max(fl, k * (nz.get(key) if np.isfinite(nz.get(key, np.nan)) else default))
+        return {"C": g("cond_approach", 0.1), "E": g("evap_approach", 0.1),
+                "P": max(1.5, k * nz.get("kwtr_pct", 1.0)), "Sub": g("subcool_k", 0.2), "Sh": g("superheat_k", 0.2),
+                "secondary": True}
+    return {"C": cfg.thr_cond, "E": cfg.thr_evap, "P": cfg.thr_kwtr_pct, "Sub": np.inf, "Sh": np.inf, "secondary": False}
+
+
+def classify_faults(d: pd.DataFrame, cfg: Config, ref: ReferenceModel, eval_mask: Optional[pd.Series] = None,
+                    signature=None) -> pd.DataFrame:
+    """Dual-loop, reference-calibrated thermodynamic classifier.
+
+    Residuals vs the healthy reference at the SAME operating point, median-filtered over a persistence window:
+      dC  condenser-approach residual [K]      dE  evaporator-approach residual [K]
+      kwtr_resid_pct  specific-power residual [%]   dSub / dSh  sub-cooling / suction-superheat residual [K]
+    Type A (fouling):  dC >= thr_C AND dE <  thr_E
+    Type B (leak):     dE >= thr_E AND dC < thr_C AND  [kW/TR resid > thr_P  (spec mode)
+                       or any of: kW/TR resid > thr_P, sub-cooling drop, superheat rise (auto mode)]
+    Both loops high -> Mixed.  A learned signature model (optional) replaces these rules.
     """
     d = d.copy()
     pred, in_dom = ref.predict(d)
-    d["ref_cond_approach"] = pred["cond_approach"]
-    d["ref_evap_approach"] = pred["evap_approach"]
-    d["ref_kw_per_tr"] = pred["kw_per_tr"].clip(lower=0.1)
-    d["dC"] = d["cond_approach"] - d["ref_cond_approach"]
-    d["dE"] = d["evap_approach"] - d["ref_evap_approach"]
-    d["kwtr_resid_pct"] = 100.0 * (d["kw_per_tr"] / d["ref_kw_per_tr"] - 1.0)
     d["in_domain"] = in_dom
+    for t in pred.columns:
+        d["ref_" + t] = pred[t]
+    d["ref_kw_per_tr"] = d["ref_kw_per_tr"].clip(lower=0.1)
+    d["ref_cond_approach"] = d["ref_cond_approach"]
+    d["ref_evap_approach"] = d["ref_evap_approach"]
 
-    hi_c = d["dC"] >= cfg.thr_cond
-    hi_e = d["dE"] >= cfg.thr_evap
-    hi_p = d["kwtr_resid_pct"] > cfg.thr_kwtr_pct
+    eligible = d["steady"] & d["in_domain"]
+    if eval_mask is not None:
+        eligible &= eval_mask
+    w = _persist_rows(d, cfg)
+    raw_res = {
+        "dC": d["cond_approach"] - d["ref_cond_approach"],
+        "dE": d["evap_approach"] - d["ref_evap_approach"],
+        "kwtr_resid_pct": 100.0 * (d["kw_per_tr"] / d["ref_kw_per_tr"] - 1.0),
+        "dTc": d["tsat_cond"] - d["ref_tsat_cond"] if "ref_tsat_cond" in d else pd.Series(np.nan, index=d.index),
+        "dSub": d["subcool_k"] - d["ref_subcool_k"] if "ref_subcool_k" in d else pd.Series(np.nan, index=d.index),
+        "dSh": d["superheat_k"] - d["ref_superheat_k"] if "ref_superheat_k" in d else pd.Series(np.nan, index=d.index),
+    }
+    for k, v in raw_res.items():
+        d[k + "_row"] = v
+        d[k] = _persist(v, eligible, w)
+
+    thr = resolve_thresholds(cfg, ref)
+    d["thr_cond"], d["thr_evap"], d["thr_kwtr"] = thr["C"], thr["E"], thr["P"]
+    hi_c = d["dC"] >= thr["C"]
+    hi_e = d["dE"] >= thr["E"]
+    hi_p = d["kwtr_resid_pct"] > thr["P"]
+    if thr["secondary"]:
+        hi_p = hi_p | (d["dSub"] <= -thr["Sub"]).fillna(False) | (d["dSh"] >= thr["Sh"]).fillna(False)
 
     label = pd.Series(SL0, index=d.index, dtype=object)
     label[hi_c & ~hi_e] = CF
     label[hi_e & hi_p & ~hi_c] = UC
     label[hi_c & hi_e] = MIXED
 
-    classified = d["steady"] & d["in_domain"]
-    if eval_mask is not None:
-        classified &= eval_mask
+    classified = eligible & d["dC"].notna()
+    if signature is not None:
+        X = d.loc[classified, SIG_FEATS].fillna(0.0)
+        if len(X):
+            label.loc[classified] = signature.predict(X)
     label[~classified] = OOD
     label[~d["steady"]] = TRANSIENT
     label[~d["running"]] = STANDBY
@@ -549,7 +672,6 @@ def classify_faults(d: pd.DataFrame, cfg: Config, ref: ReferenceModel, eval_mask
     d["fault_label"] = label
     d["classified"] = label.isin([SL0, CF, UC, MIXED])
 
-    # expected power at the same operating point and wasted power
     d["kw_expected"] = d["ref_kw_per_tr"] * d["tr"]
     d["delta_kw"] = np.where(d["classified"], d["kw"] - d["kw_expected"], 0.0)
     return d
@@ -566,7 +688,7 @@ def primary_diagnosis(d: pd.DataFrame, cfg: Config) -> Tuple[str, dict]:
     shares = {"n": n, "share_cf": s_cf, "share_uc": s_uc, "share_sl0": 100.0 * (c["fault_label"] == SL0).mean()}
     m = cfg.min_fault_share
     if s_cf >= m and s_uc >= m:
-        return MIXED, shares
+        return (CF if s_cf >= s_uc * 1.5 else UC if s_uc >= s_cf * 1.5 else MIXED), shares
     if s_cf >= m:
         return CF, shares
     if s_uc >= m:
@@ -608,28 +730,32 @@ def financials(d: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, dict]:
     return d, fin
 
 
-def run_pipeline(raw: pd.DataFrame, cfg: Config, ref: Optional[ReferenceModel] = None, eval_mask_fn=None):
-    """normalise -> physics -> features -> (fit reference) -> classify -> financials."""
+def run_pipeline(raw: pd.DataFrame, cfg: Config, ref: Optional[ReferenceModel] = None, eval_mask_fn=None, signature=None):
+    """normalise -> physics -> features -> (select/fit reference) -> classify -> financials."""
     norm, meta = normalize_bms_columns(raw, cfg)
     ph = physics_engine(norm, cfg)
     feat = prepare_features(ph, cfg)
     if ref is None:
-        ref = fit_reference_from_window(feat, cfg)
+        ref = select_reference(feat, cfg)
     em = eval_mask_fn(feat) if eval_mask_fn else None
-    scored = classify_faults(feat, cfg, ref, em)
+    scored = classify_faults(feat, cfg, ref, em, signature)
     scored, fin = financials(scored, cfg)
     dx, shares = primary_diagnosis(scored, cfg)
+    cov = 100.0 * scored["classified"].sum() / max(int(scored["running"].sum()), 1)
+    if cov < 30.0 and dx == SL0:
+        dx = "INDETERMINATE"
     c = scored[scored["classified"]]
     summary = {
         **fin,
         "diagnosis": dx,
         "shares": shares,
-        "coverage_pct": 100.0 * scored["classified"].sum() / max(int(scored["running"].sum()), 1),
+        "coverage_pct": cov,
         "kwtr_actual": float(c["kw_per_tr"].median()) if len(c) else np.nan,
         "kwtr_ideal": float(c["ref_kw_per_tr"].median()) if len(c) else np.nan,
-        "max_dC": float(c["dC"].quantile(0.95)) if len(c) else np.nan,
-        "max_dE": float(c["dE"].quantile(0.95)) if len(c) else np.nan,
+        "med_dC": float(c["dC"].median()) if len(c) else np.nan,
+        "med_dE": float(c["dE"].median()) if len(c) else np.nan,
         "ref": ref.describe(),
+        "thr": resolve_thresholds(cfg, ref),
     }
     if "tr_meas" in scored and "tr_est" in scored:
         ok = scored["running"] & scored["tr_meas"].gt(5)
@@ -770,39 +896,98 @@ def infer_label(filename: str) -> str:
     return SL0
 
 
-def benchmark_uploaded(files: Dict[str, Tuple[pd.DataFrame, str]], cfg: Config):
-    """files: {name: (raw_df, truth_label)}.  The SL0 file fits the reference on even 30-min blocks and is scored on odd blocks."""
+def benchmark_uploaded(files: Dict[str, Tuple[pd.DataFrame, str]], cfg: Config, ref_choice: str = "builtin"):
+    """files: {name: (raw_df, truth_label)}.
+
+    ref_choice "builtin": healthy reference shipped with the app (fitted on RP-1043 normal.xls).
+    ref_choice "sl0_file": fit on the even 30-min blocks of the uploaded SL0 file; that file is scored on its odd blocks only.
+    Returns (reference, per_file_df, y_true, y_pred, frames) where frames = [(name, scored_df, truth)].
+    """
     prepared = {}
     for name, (raw, truth) in files.items():
-        norm, meta = normalize_bms_columns(raw, cfg)
-        feat = prepare_features(physics_engine(norm, cfg), cfg)
-        prepared[name] = (feat, truth)
-    sl0_names = [n for n, (_, t) in prepared.items() if t == SL0]
-    if not sl0_names:
-        raise ValueError("Upload at least one file labelled SL0_Healthy: it provides the healthy reference.")
-    base_name = sl0_names[0]
-    base, _ = prepared[base_name]
-    block = (base["t_s"] // 1800).astype(int)
-    even = (block % 2 == 0)
-    ref = fit_reference_from_log(base, even, f"{base_name}: even 30-min blocks")
-    rows, ytrue, ypred = [], [], []
+        norm, _ = normalize_bms_columns(raw, cfg)
+        prepared[name] = (prepare_features(physics_engine(norm, cfg), cfg), truth)
+    base_name = None
+    if ref_choice == "builtin":
+        ref = builtin_reference()
+        if ref is None:
+            raise ValueError("Built-in reference is not available in this build.")
+    else:
+        sl0_names = [n for n, (_, t) in prepared.items() if t == SL0]
+        if not sl0_names:
+            raise ValueError("Upload at least one file labelled SL0_Healthy, or choose the built-in reference.")
+        base_name = sl0_names[0]
+        base, _ = prepared[base_name]
+        even = ((base["t_s"] // 1800).astype(int) % 2 == 0)
+        ref = fit_reference_from_log(base, even, f"{base_name}: even 30-min blocks", _persist_rows(base, cfg))
+    rows, ytrue, ypred, frames = [], [], [], []
     for name, (feat, truth) in prepared.items():
-        em = None
-        if name == base_name:
-            em = ((feat["t_s"] // 1800).astype(int) % 2 == 1)
+        em = ((feat["t_s"] // 1800).astype(int) % 2 == 1) if name == base_name else None
         sc = classify_faults(feat, cfg, ref, em)
+        frames.append((name, sc, truth))
         c = sc[sc["classified"]]
         ytrue += [truth] * len(c)
         ypred += list(c["fault_label"])
         counts = c["fault_label"].value_counts()
         rows.append({
             "file": name, "truth": truth, "rows scored": len(c),
-            "median dCond [K]": round(c["dC"].median(), 2) if len(c) else np.nan,
-            "median dEvap [K]": round(c["dE"].median(), 2) if len(c) else np.nan,
-            "median kW/TR resid [%]": round(c["kwtr_resid_pct"].median(), 1) if len(c) else np.nan,
+            "med dCond [K]": round(c["dC"].median(), 2) if len(c) else np.nan,
+            "med dEvap [K]": round(c["dE"].median(), 2) if len(c) else np.nan,
+            "med kW/TR [%]": round(c["kwtr_resid_pct"].median(), 1) if len(c) else np.nan,
+            "med dSubcool [K]": round(c["dSub"].median(), 2) if len(c) else np.nan,
+            "med dSuperheat [K]": round(c["dSh"].median(), 2) if len(c) else np.nan,
             **{f"% {k}": round(100 * counts.get(k, 0) / max(len(c), 1), 1) for k in [SL0, CF, UC, MIXED]},
         })
-    return ref, pd.DataFrame(rows), ytrue, ypred
+    return ref, pd.DataFrame(rows), ytrue, ypred, frames
+
+
+def train_signature(frames: List[Tuple[str, pd.DataFrame, str]], step: int = 10):
+    """Learn a fault signature (standardised logistic regression on the residual vector SIG_FEATS)
+    from labelled, already-scored files.  Returns (model, report_df, confusion_df, validation_note)."""
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    Xs, ys, gs, bl = [], [], [], []
+    for name, sc, truth in frames:
+        c = sc[sc["classified"]].iloc[::step]
+        if len(c) == 0:
+            continue
+        Xs.append(c[SIG_FEATS].fillna(0.0))
+        ys += [truth] * len(c)
+        gs += [name] * len(c)
+        bl += list(((c["t_s"] // 1800).astype(int) % 2).values)
+    if not Xs:
+        raise ValueError("No classified rows available for training.")
+    X = pd.concat(Xs, ignore_index=True)
+    y, g, bl = np.array(ys), np.array(gs), np.array(bl)
+    if len(set(y)) < 2:
+        raise ValueError("Need at least two different ground-truth classes to train.")
+    mk = lambda: make_pipeline(StandardScaler(), LogisticRegression(class_weight="balanced", max_iter=3000))
+    files_per_class = {k: len(set(g[y == k])) for k in sorted(set(y))}
+    yp = np.empty(len(y), dtype=object)
+    if all(v >= 2 for v in files_per_class.values()) and len(files_per_class) >= 2:
+        for grp in sorted(set(g)):
+            te = g == grp
+            if len(set(y[~te])) < 2:
+                yp[te] = y[~te][0]
+                continue
+            yp[te] = mk().fit(X[~te], y[~te]).predict(X[te])
+        note = f"Leave-one-FILE-out validation across {len(set(g))} files (files per class: {files_per_class}). This is the honest estimate."
+        mask = np.ones(len(y), dtype=bool)
+    else:
+        tr, te = bl == 0, bl == 1
+        yp[:] = ""
+        yp[te] = mk().fit(X[tr], y[tr]).predict(X[te])
+        mask = te
+        note = (f"Only {files_per_class} file(s) per class, so validation used held-out 30-min time blocks of the SAME files. "
+                "This is OPTIMISTIC (the model can learn file identity). Load >= 2 files per class for leave-one-file-out validation.")
+    labs = [l for l in CLASS_LABELS if l in set(y)]
+    rep = pd.DataFrame(classification_report(y[mask], yp[mask], labels=labs, zero_division=0, output_dict=True)).T.round(3)
+    cm = confusion_matrix(y[mask], yp[mask], labels=labs)
+    cm_df = pd.DataFrame(cm, index=[f"true {l}" for l in labs], columns=[f"pred {l}" for l in labs])
+    model = mk().fit(X, y)
+    return model, rep, cm_df, note
 
 
 def benchmark_synthetic(cfg: Config, weather: str, runs_per_class: int = 3):
@@ -851,10 +1036,10 @@ def fig_approach(d: pd.DataFrame, cfg: Config, title: str) -> go.Figure:
     evap = p["evap_approach"].where(ok)
     fig.add_trace(go.Scatter(x=x, y=cond, name="Condenser approach (actual)", line=dict(color="#d62728", width=1.6), connectgaps=False))
     fig.add_trace(go.Scatter(x=x, y=p["ref_cond_approach"].where(ok), name="Condenser approach (healthy ref)", line=dict(color="#d62728", dash="dash", width=1.2), connectgaps=False))
-    fig.add_trace(go.Scatter(x=x, y=(p["ref_cond_approach"] + cfg.thr_cond).where(ok), name=f"Type A trigger (+{cfg.thr_cond:g} K)", line=dict(color="#d62728", dash="dot", width=0.8), opacity=0.6, connectgaps=False))
+    fig.add_trace(go.Scatter(x=x, y=(p["ref_cond_approach"] + p["thr_cond"]).where(ok), name="Type A trigger", line=dict(color="#d62728", dash="dot", width=0.8), opacity=0.6, connectgaps=False))
     fig.add_trace(go.Scatter(x=x, y=evap, name="Evaporator approach (actual)", line=dict(color="#1f77b4", width=1.6), connectgaps=False))
     fig.add_trace(go.Scatter(x=x, y=p["ref_evap_approach"].where(ok), name="Evaporator approach (healthy ref)", line=dict(color="#1f77b4", dash="dash", width=1.2), connectgaps=False))
-    fig.add_trace(go.Scatter(x=x, y=(p["ref_evap_approach"] + cfg.thr_evap).where(ok), name=f"Type B trigger (+{cfg.thr_evap:g} K)", line=dict(color="#1f77b4", dash="dot", width=0.8), opacity=0.6, connectgaps=False))
+    fig.add_trace(go.Scatter(x=x, y=(p["ref_evap_approach"] + p["thr_evap"]).where(ok), name="Type B trigger", line=dict(color="#1f77b4", dash="dot", width=0.8), opacity=0.6, connectgaps=False))
     fig.add_trace(go.Scatter(x=x, y=p["cond_approach_g14"].where(ok), name="ASHRAE G14 baseline (2.0+0.03(T-25))", line=dict(color="#7f7f7f", dash="longdash", width=1.0), connectgaps=False))
     fig.update_layout(title=title, yaxis_title="Approach temperature [K]", xaxis_title="Elapsed hours" if not np.issubdtype(np.asarray(d["x"]).dtype, np.datetime64) else "Time",
                       height=430, margin=dict(l=10, r=10, t=50, b=10), legend=dict(orientation="h", y=-0.25), template="plotly_white")
@@ -934,6 +1119,14 @@ def render_dashboard(scored: pd.DataFrame, meta: dict, summary: dict, cfg: Confi
         )
     else:
         st.info("Too few steady, in-domain rows to diagnose. Widen the reference window, relax steady-state gating, or supply a healthy reference log.")
+    th = summary.get("thr")
+    if th:
+        st.caption(f"Triggers used: condenser approach +{th['C']:.2f} K, evaporator approach +{th['E']:.2f} K, kW/TR +{th['P']:.1f}%"
+                   + (f", sub-cooling -{th['Sub']:.2f} K, superheat +{th['Sh']:.2f} K" if th.get("secondary") else "")
+                   + f" | persistence window {cfg.persist_s:.0f} s")
+    if summary["diagnosis"] == "INDETERMINATE":
+        st.warning("Indeterminate: too few rows fall inside the healthy-reference operating envelope to call this chiller healthy. "
+                   "Upload a healthy reference log from the same plant (Tab 3) or widen the reference window.")
     for nt in meta.get("notes", []):
         st.caption(nt)
     if "tr_ratio" in summary:
@@ -945,7 +1138,9 @@ def render_dashboard(scored: pd.DataFrame, meta: dict, summary: dict, cfg: Confi
 def main():
     st.set_page_config(page_title="UAE Chiller FDD", page_icon="❄️", layout="wide")
     st.title("❄️ UAE Centrifugal Chiller Predictive Maintenance & FDD")
-    st.caption("First-principles R-134a enthalpy physics + reference-calibrated thermodynamic fault classifier (no unsupervised ML).")
+    st.caption("First-principles R-134a enthalpy physics + reference-calibrated thermodynamic fault classifier "
+               "(optionally with a signature learned from your labelled files).")
+    ss = st.session_state
 
     sb = st.sidebar
     sb.header("Live simulator")
@@ -958,27 +1153,36 @@ def main():
     tariff = sb.number_input("DEWA tariff (AED/kWh)", 0.05, 2.0, 0.44, step=0.01, format="%.2f")
     eta = sb.slider("Compressor/motor effective efficiency (eta)", 0.50, 1.00, 0.69, 0.01,
                     help="Scales kW to refrigerant-side power in the enthalpy tonnage. 0.69 was calibrated on the RP-1043 lab chiller; calibrate on your plant.")
-    profile = sb.selectbox("Detection thresholds", ["Spec / field (1.5 K, 1.5 K, +10 %)", "Low-severity lab (0.4 K, 0.4 K, +0 %)", "Custom"], index=0)
+    profile = sb.selectbox("Detection sensitivity", ["Auto: 3-sigma of healthy noise (recommended)", "Spec: 1.5 K / 1.5 K / +10 %", "Custom"], index=0)
+    thr_mode, thr_c, thr_e, thr_p = "auto", 1.5, 1.5, 10.0
     if profile.startswith("Spec"):
-        thr_c, thr_e, thr_p = 1.5, 1.5, 10.0
-    elif profile.startswith("Low"):
-        thr_c, thr_e, thr_p = 0.4, 0.4, 0.0
-    else:
-        thr_c = sb.number_input("Condenser approach trigger (K)", 0.1, 10.0, 1.5, 0.1)
-        thr_e = sb.number_input("Evaporator approach trigger (K)", 0.1, 10.0, 1.5, 0.1)
+        thr_mode = "spec"
+    elif profile == "Custom":
+        thr_mode = "custom"
+        thr_c = sb.number_input("Condenser approach trigger (K)", 0.1, 10.0, 1.5, 0.05)
+        thr_e = sb.number_input("Evaporator approach trigger (K)", 0.1, 10.0, 1.5, 0.05)
         thr_p = sb.number_input("kW/TR residual trigger (%)", -5.0, 50.0, 10.0, 0.5)
+    ref_choice = sb.selectbox("Healthy reference", ["Auto (built-in RP-1043 SL0 if the data fits, else first-N % window)",
+                                                    "Built-in RP-1043 SL0 reference", "First-N % window of the file"], index=0)
+    ref_mode = "auto" if ref_choice.startswith("Auto") else "builtin" if ref_choice.startswith("Built-in") else "window"
     med_win = sb.slider("Rolling-median samples (noise filter)", 1, 61, 5, 2)
+    persist_s = sb.slider("Persistence window (s)", 0, 7200, 1800, 300, help="Residuals are median-filtered over this window before classification.")
     steady = sb.selectbox("Steady-state gating", ["auto", "on", "off"], index=0,
                           help="auto = on when sample interval <= 2 min (lab data), off for 15-min BMS trends.")
     min_share = sb.slider("Min. share of rows to declare a dataset-level fault (%)", 5, 90, 25, 5)
     cap_src = sb.selectbox("Capacity source", ["Enthalpy estimate (flow-meter-free)", "Measured tons column (if present)"], index=0)
+    signature = None
+    if "signature" in ss:
+        if sb.checkbox("Use learned signature model (trained in Tab 2)", value=True):
+            signature = ss["signature"]
     with sb.expander("Unit overrides / time fallback"):
         tu = st.selectbox("Temperature unit", ["auto", "degF", "degC"])
         pu = st.selectbox("Pressure unit", ["auto", "psig", "kPa_abs", "kPa_g", "bar_abs"])
         adt = st.number_input("Assumed sample interval (s) if no time column", 1.0, 3600.0, 60.0)
 
-    cfg = Config(tariff=tariff, eta=eta, median_win=med_win, thr_cond=thr_c, thr_evap=thr_e, thr_kwtr_pct=thr_p,
-                 min_fault_share=float(min_share), capacity_source="measured" if cap_src.startswith("Measured") else "enthalpy",
+    cfg = Config(tariff=tariff, eta=eta, median_win=med_win, thr_mode=thr_mode, thr_cond=thr_c, thr_evap=thr_e, thr_kwtr_pct=thr_p,
+                 persist_s=float(persist_s), ref_mode=ref_mode, min_fault_share=float(min_share),
+                 capacity_source="measured" if cap_src.startswith("Measured") else "enthalpy",
                  steady_gate=steady, temp_unit=tu, pressure_unit=pu, assumed_dt_s=adt)
 
     tab1, tab2, tab3 = st.tabs(["🇦🇪 Live UAE Simulator", "📐 RP-1043 Benchmark Validation", "🧾 Zero-Risk BMS Log File Audit"])
@@ -987,13 +1191,14 @@ def main():
     with tab1:
         st.subheader(f"{scenario} | {weather if scenario != 'Extreme Weather' else 'Heat-wave (extreme)'}")
         ref_pct1 = st.slider("Healthy reference window (first % of records)", 5, 30, 12, key="ref1")
-        c1cfg = replace(cfg, ref_pct=float(ref_pct1), steady_gate="off")
+        c1cfg = replace(cfg, ref_pct=float(ref_pct1), steady_gate="off", ref_mode="window", persist_s=min(cfg.persist_s, 3600.0))
         try:
             raw = simulate_uae(weather, scenario, design_tr=float(design_tr), eta=eta, seed=int(sim_seed))
-            scored, meta, summ = run_pipeline(raw, c1cfg)
+            scored, meta, summ = run_pipeline(raw, c1cfg, signature=None)
             render_dashboard(scored, meta, summ, c1cfg, "Condenser & evaporator approach: actual vs weather-normalised healthy reference")
             st.caption("Simulator note: the fault ramps in after ~30 % of the run so the healthy window is clean. "
-                       "'Extreme Weather' is a healthy chiller in a heat-wave, i.e. a false-alarm test of the weather normalisation.")
+                       "'Extreme Weather' is a healthy chiller in a heat-wave, i.e. a false-alarm test of the weather normalisation. "
+                       "The simulator always uses the first-N % window reference and the rule-based classifier.")
         except Exception as e:  # noqa: BLE001
             st.error(f"Simulation failed: {e}")
 
@@ -1002,8 +1207,9 @@ def main():
         st.subheader("Classifier validation against ground-truth labels")
         mode = st.radio("Benchmark source", ["Upload ASHRAE RP-1043 files", "Synthetic ground-truth generator"], horizontal=True)
         if mode.startswith("Upload"):
-            st.write("Upload the healthy file (e.g. `normal.xls`) plus fault files (`cf*.xls`, `rl*.xls`). "
-                     "The SL0 file fits the healthy reference on its even 30-min blocks and is scored only on its odd blocks, so it is never graded on data it was fitted on.")
+            st.write("Upload any number of RP-1043 workbooks (`normal`, `cf*`, `rl*`...). Labels are inferred from file names; correct them if needed. "
+                     "Using the built-in reference, each file is judged against the healthy SL0 model; the SL0 file you upload is then just another test case.")
+            bm_ref = st.radio("Healthy reference for the benchmark", ["Built-in SL0 reference", "Fit on the uploaded SL0 file (held-out blocks)"], horizontal=True)
             ups = st.file_uploader("RP-1043 workbooks", type=["xls", "xlsx", "csv"], accept_multiple_files=True, key="bm_up")
             if ups:
                 labels = {}
@@ -1013,22 +1219,43 @@ def main():
                     try:
                         with st.spinner("Reading workbooks and classifying..."):
                             files = {u.name: (read_table(u.name, u.getvalue()), labels[u.name]) for u in ups}
-                            ref, per_file, yt, yp = benchmark_uploaded(files, cfg)
-                        st.caption(f"Reference: {ref.describe()}")
-                        rep_df, cm_df = report_frames(yt, yp)
-                        st.markdown("**Per-file residual summary** (what the classifier actually sees)")
-                        show_df(per_file)
-                        st.markdown("**sklearn classification report**")
-                        show_df(rep_df)
-                        show_fig(fig_confusion(cm_df))
-                        st.info("Thresholds are set in the sidebar. The shipped RP-1043 fault files have small severities: check the median residuals above against your trigger values.")
+                            ref, per_file, yt, yp, frames = benchmark_uploaded(files, cfg, "builtin" if bm_ref.startswith("Built") else "sl0_file")
+                        ss["bm"] = {"ref": ref.describe(), "per_file": per_file, "yt": yt, "yp": yp, "frames": frames}
                     except Exception as e:  # noqa: BLE001
                         st.error(f"Benchmark failed: {e}")
+            bm = ss.get("bm")
+            if bm:
+                st.caption(f"Reference: {bm['ref']}")
+                rep_df, cm_df = report_frames(bm["yt"], bm["yp"])
+                st.markdown("**Per-file residual summary** (what the classifier actually sees; send this table back if you want thresholds tuned)")
+                show_df(bm["per_file"])
+                st.download_button("⬇️ Download per-file summary CSV", bm["per_file"].to_csv(index=False).encode("utf-8"),
+                                   file_name="rp1043_per_file_summary.csv", mime="text/csv")
+                st.markdown("**sklearn classification report (rule-based classifier)**")
+                show_df(rep_df)
+                show_fig(fig_confusion(cm_df))
+                st.markdown("---")
+                st.markdown("### Learn the fault signature from these labelled files")
+                st.write("Fits a standardised logistic regression on the residual vector (condenser approach, evaporator approach, kW/TR, "
+                         "saturation temp, sub-cooling, superheat). With >= 2 files per class it is validated leave-one-file-out. "
+                         "Once trained, tick the sidebar box to use it in Tab 3.")
+                if st.button("Train signature model"):
+                    try:
+                        model, trep, tcm, note = train_signature(bm["frames"])
+                        ss["signature"] = model
+                        ss["sig_report"] = (trep, tcm, note)
+                    except Exception as e:  # noqa: BLE001
+                        st.error(f"Training failed: {e}")
+                if "sig_report" in ss:
+                    trep, tcm, note = ss["sig_report"]
+                    st.info(note)
+                    show_df(trep)
+                    show_fig(fig_confusion(tcm))
         else:
             runs = st.slider("Runs per scenario", 1, 6, 3)
             if st.button("Generate & evaluate", type="primary"):
                 with st.spinner("Simulating and classifying..."):
-                    per_run, yt, yp = benchmark_synthetic(replace(cfg, ref_pct=12.0), weather, runs)
+                    per_run, yt, yp = benchmark_synthetic(replace(cfg, ref_pct=12.0, ref_mode="window"), weather, runs)
                 rep_df, cm_df = report_frames(yt, yp)
                 show_df(per_run)
                 show_df(rep_df)
@@ -1040,9 +1267,9 @@ def main():
     with tab3:
         st.subheader("Read-only audit of a BMS / lab log")
         up = st.file_uploader("BMS log or RP-1043 workbook", type=["csv", "xlsx", "xls"], key="audit_up")
-        ref_log = st.file_uploader("Optional: known-healthy reference log (recommended if the audited file may already be faulty at row 0)",
+        ref_log = st.file_uploader("Optional: known-healthy reference log from the same plant (recommended if the audited file may already be faulty at row 0)",
                                    type=["csv", "xlsx", "xls"], key="ref_up")
-        ref_pct = st.slider("Healthy reference window (first % of records)", 5, 30, 12, key="ref3")
+        ref_pct = st.slider("Healthy reference window (first % of records) - used only when no built-in/healthy-log reference applies", 5, 30, 12, key="ref3")
         if up is not None:
             try:
                 data = up.getvalue()
@@ -1055,16 +1282,18 @@ def main():
                 if ref_log is not None:
                     rnorm, _ = normalize_bms_columns(read_table(ref_log.name, ref_log.getvalue()), c3cfg)
                     rfeat = prepare_features(physics_engine(rnorm, c3cfg), c3cfg)
-                    ref_model = fit_reference_from_log(rfeat, None, f"healthy log '{ref_log.name}'")
-                scored3, meta3, summ3 = run_pipeline(raw3, c3cfg, ref=ref_model)
-                if ref_model is None:
+                    ref_model = fit_reference_from_log(rfeat, None, f"healthy log '{ref_log.name}'", _persist_rows(rfeat, c3cfg))
+                scored3, meta3, summ3 = run_pipeline(raw3, c3cfg, ref=ref_model, signature=signature)
+                if ref_model is None and summ3["ref"].find("first") >= 0:
                     st.info("Reference = first-N % window of this file. A fault already present at row 0 will be absorbed into the baseline; upload a healthy log above to avoid that.")
+                if signature is not None:
+                    st.info("Fault labels come from the learned signature model.")
                 render_dashboard(scored3, meta3, summ3, c3cfg, "Approach temperatures vs healthy reference", tab3=True)
                 with st.expander("Detected column mapping"):
                     show_df(pd.DataFrame({"canonical": list(meta3["mapping"].keys()), "source column": list(meta3["mapping"].values())}))
                 cols = ["_row", "x", "t_s", "running", "steady", "in_domain", "fault_label", "tr", "kw", "kw_per_tr", "ref_kw_per_tr",
                         "cond_approach", "ref_cond_approach", "dC", "evap_approach", "ref_evap_approach", "dE", "kwtr_resid_pct",
-                        "delta_kw", "waste_kwh", "waste_aed"]
+                        "dSub", "dSh", "delta_kw", "waste_kwh", "waste_aed"]
                 out = scored3[[c for c in cols if c in scored3]].rename(columns={"_row": "source_row"})
                 st.download_button("⬇️ Download scored audit CSV", out.to_csv(index=False).encode("utf-8"),
                                    file_name="chiller_audit_scored.csv", mime="text/csv")
